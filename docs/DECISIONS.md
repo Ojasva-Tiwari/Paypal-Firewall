@@ -93,3 +93,4 @@ Per AGENTS.md rule 10, every external package dependency must have an explicit j
 | `@eslint/js` | devDependency | Official ESLint JavaScript core recommended rules for ESLint 9 flat configuration. |
 | `typescript-eslint` | devDependency | Tooling enabling ESLint to analyze TypeScript codebases. |
 | `tsx` | devDependency | Node.js execution engine for TypeScript scripts, test helpers, and spikes. |
+| `zod` | dependency | Schema validation for policy documents, environment configuration, and MCP tool input payloads per PLAN.md Section 7. |
