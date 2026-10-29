@@ -80,8 +80,8 @@ function getCredentials(): { clientId: string; clientSecret: string; vaultTokenI
     process.exit(1);
   }
 
-  // Check command line arg, env var, or fallback to S2 token
-  const vaultTokenId = process.argv[2] || process.env.VAULT_TOKEN_ID || '2m430894bj312712d';
+  // Check command line arg, env var, or fallback to verified US Personal S2 token
+  const vaultTokenId = process.argv[2] || process.env.VAULT_TOKEN_ID || '69266860j82772632';
 
   return { clientId, clientSecret, vaultTokenId };
 }
@@ -99,7 +99,8 @@ async function getOAuthToken(clientId: string, clientSecret: string): Promise<st
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Failed to obtain OAuth token [${response.status}]: ${errorText}`);
+    const debugId = response.headers.get('paypal-debug-id') || 'N/A';
+    throw new Error(`Failed to obtain OAuth token [${response.status}] (debug_id: ${debugId}): ${errorText}`);
   }
 
   const data = (await response.json()) as OAuthTokenResponse;
@@ -118,9 +119,8 @@ async function createAuthorizeOrder(accessToken: string, vaultTokenId: string): 
     body: JSON.stringify({
       intent: 'AUTHORIZE',
       payment_source: {
-        token: {
-          id: vaultTokenId,
-          type: 'PAYMENT_METHOD_TOKEN',
+        paypal: {
+          vault_id: vaultTokenId,
         },
       },
       purchase_units: [
@@ -139,7 +139,8 @@ async function createAuthorizeOrder(accessToken: string, vaultTokenId: string): 
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Failed to create AUTHORIZE order [${response.status}]: ${errorText}`);
+    const debugId = response.headers.get('paypal-debug-id') || 'N/A';
+    throw new Error(`Failed to create AUTHORIZE order [${response.status}] (debug_id: ${debugId}): ${errorText}`);
   }
 
   return (await response.json()) as OrderResponse;
@@ -159,7 +160,8 @@ async function authorizeOrder(accessToken: string, orderId: string): Promise<Ord
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Failed to authorize order [${response.status}]: ${errorText}`);
+    const debugId = response.headers.get('paypal-debug-id') || 'N/A';
+    throw new Error(`Failed to authorize order [${response.status}] (debug_id: ${debugId}): ${errorText}`);
   }
 
   return (await response.json()) as OrderResponse;

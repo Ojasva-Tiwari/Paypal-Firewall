@@ -78,6 +78,12 @@ This document records the foundational decisions made for PayGuard. As spikes ar
 - **Decision**: Set default hold TTL to 15 minutes for demo purposes. On expiration, the hold is automatically voided.
 - **Consequences**: Predictable lifecycle for automated testing and live demos.
 
+### D13: Expiry Worker Deferred to Canonical Milestone M4 (M4-T4)
+- **Date**: 2026-10-29
+- **Context**: In M2-T6, `executeDecision` was verified to fail closed on `EXPIRED` requests by treating them as `NO_OP`, intentionally avoiding local release of the ledger `RESERVE` entry without an automated PayPal void operation.
+- **Decision**: Keep expiry handling strictly within the canonical milestone boundary: automated voiding and single `RELEASE` row generation remain scheduled for Milestone M4 (Task M4-T4: Expiry Worker and lazy expiry check on approval). `executeDecision` continues to treat expired requests as non-executable NO_OP, keeping budget reservations intact until explicitly voided via PayPal.
+- **Consequences**: No premature release of held funds; fail-closed budget protection is preserved across M2 and M3 without pulling M4 approval/worker scope forward.
+
 ---
 
 ## Dependency Justification Log
@@ -94,3 +100,5 @@ Per AGENTS.md rule 10, every external package dependency must have an explicit j
 | `typescript-eslint` | devDependency | Tooling enabling ESLint to analyze TypeScript codebases. |
 | `tsx` | devDependency | Node.js execution engine for TypeScript scripts, test helpers, and spikes. |
 | `zod` | dependency | Schema validation for policy documents, environment configuration, and MCP tool input payloads per PLAN.md Section 7. |
+| `better-sqlite3` | dependency | Embedded synchronous SQLite3 database driver for atomic transactions and local storage per PLAN.md Section 7 and Decision D2. |
+| `@types/better-sqlite3` | devDependency | TypeScript type definitions for better-sqlite3. |
