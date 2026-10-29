@@ -253,6 +253,13 @@ export class Repositories {
         id
       );
     },
+    listNeedingReconciliation: (): PaymentRequestRow[] => {
+      return this.db
+        .prepare(
+          "SELECT * FROM payment_requests WHERE status IN ('AUTO_EXECUTING', 'CAPTURING', 'HELD') ORDER BY created_at ASC"
+        )
+        .all() as PaymentRequestRow[];
+    },
   };
 
   public readonly ledger = {
