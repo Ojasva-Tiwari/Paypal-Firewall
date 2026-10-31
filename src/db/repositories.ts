@@ -54,6 +54,9 @@ export class Repositories {
     listActive: (): AgentRow[] => {
       return this.db.prepare("SELECT * FROM agents WHERE status = 'ACTIVE' ORDER BY created_at ASC").all() as AgentRow[];
     },
+    listAll: (): AgentRow[] => {
+      return this.db.prepare('SELECT * FROM agents ORDER BY created_at ASC').all() as AgentRow[];
+    },
     insert: (agent: AgentRow): void => {
       this.db.prepare(`
         INSERT INTO agents (id, name, api_key_hash, status, daily_budget_minor, created_at)
@@ -126,6 +129,13 @@ export class Repositories {
     },
     getByVersion: (version: number): PolicyVersionRow | undefined => {
       return this.db.prepare('SELECT * FROM policy_versions WHERE version = ?').get(version) as PolicyVersionRow | undefined;
+    },
+    listAll: (): PolicyVersionRow[] => {
+      return this.db.prepare('SELECT * FROM policy_versions ORDER BY version DESC').all() as PolicyVersionRow[];
+    },
+    getNextVersion: (): number => {
+      const row = this.db.prepare('SELECT MAX(version) as max_v FROM policy_versions').get() as { max_v: number | null } | undefined;
+      return (row?.max_v ?? 0) + 1;
     },
     insert: (policy: PolicyVersionRow): void => {
       this.db.prepare(`
@@ -253,12 +263,93 @@ export class Repositories {
         id
       );
     },
+    updateRemoteVoidStatus: (
+      id: string,
+      status: 'PENDING' | 'CONFIRMED' | 'FAILED',
+      updatedAt?: string
+    ): void => {
+      const now = updatedAt || new Date().toISOString();
+      this.db.prepare(`
+        UPDATE payment_requests
+        SET remote_void_status = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(status, now, id);
+    },
     listNeedingReconciliation: (): PaymentRequestRow[] => {
       return this.db
-        .prepare(
-          "SELECT * FROM payment_requests WHERE status IN ('AUTO_EXECUTING', 'CAPTURING', 'HELD') ORDER BY created_at ASC"
-        )
+        .prepare(`
+          SELECT * FROM payment_requests
+          WHERE status IN ('AUTO_EXECUTING', 'CAPTURING', 'HELD', 'APPROVED')
+             OR remote_void_status IN ('PENDING', 'FAILED')
+          ORDER BY created_at ASC
+        `)
         .all() as PaymentRequestRow[];
+    },
+    listExpiredHeld: (nowIso?: string): PaymentRequestRow[] => {
+      const cutoff = nowIso || new Date().toISOString();
+      return this.db
+        .prepare(`
+          SELECT * FROM payment_requests
+          WHERE status = 'HELD'
+            AND expires_at IS NOT NULL
+            AND expires_at <= ?
+          ORDER BY expires_at ASC
+        `)
+        .all(cutoff) as PaymentRequestRow[];
+    },
+    list: (options?: { status?: string; limit?: number; offset?: number }): PaymentRequestRow[] => {
+      const limit = Math.min(Math.max(1, options?.limit ?? 50), 100);
+      const offset = Math.max(0, options?.offset ?? 0);
+      if (options?.status) {
+        return this.db
+          .prepare(
+            'SELECT * FROM payment_requests WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?'
+          )
+          .all(options.status, limit, offset) as PaymentRequestRow[];
+      }
+      return this.db
+        .prepare(
+          'SELECT * FROM payment_requests ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?'
+        )
+        .all(limit, offset) as PaymentRequestRow[];
+    },
+    count: (options?: { status?: string }): number => {
+      if (options?.status) {
+        const row = this.db.prepare('SELECT COUNT(*) as c FROM payment_requests WHERE status = ?').get(options.status) as { c: number } | undefined;
+        return row?.c ?? 0;
+      }
+      const row = this.db.prepare('SELECT COUNT(*) as c FROM payment_requests').get() as { c: number } | undefined;
+      return row?.c ?? 0;
+    },
+    count24hByDecision: (windowStartIso: string): { total: number; allowed: number; held: number; denied: number } => {
+      const query = `
+        SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN decision = 'ALLOW' THEN 1 ELSE 0 END) as allowed,
+          SUM(CASE WHEN decision = 'HOLD' THEN 1 ELSE 0 END) as held,
+          SUM(CASE WHEN decision = 'DENY' THEN 1 ELSE 0 END) as denied
+        FROM payment_requests
+        WHERE created_at >= ?
+      `;
+      const row = this.db.prepare(query).get(windowStartIso) as {
+        total: number;
+        allowed: number | null;
+        held: number | null;
+        denied: number | null;
+      } | undefined;
+      return {
+        total: row?.total ?? 0,
+        allowed: row?.allowed ?? 0,
+        held: row?.held ?? 0,
+        denied: row?.denied ?? 0,
+      };
+    },
+    listRecent: (limit = 10): PaymentRequestRow[] => {
+      const clampedLimit = Math.min(Math.max(1, limit), 50);
+      return this.db
+        .prepare('SELECT * FROM payment_requests ORDER BY created_at DESC, rowid DESC LIMIT ?')
+        .all(clampedLimit) as PaymentRequestRow[];
     },
   };
 
@@ -311,6 +402,18 @@ export class Repositories {
       );
       return res.changes > 0;
     },
+    listByRequestId: (requestId: string): ApprovalRow[] => {
+      return this.db
+        .prepare('SELECT * FROM approvals WHERE request_id = ? ORDER BY created_at ASC')
+        .all(requestId) as ApprovalRow[];
+    },
+    invalidateForRequest: (requestId: string, usedAtIso?: string): number => {
+      const usedAt = usedAtIso || new Date().toISOString();
+      const res = this.db
+        .prepare('UPDATE approvals SET used_at = ? WHERE request_id = ? AND used_at IS NULL')
+        .run(usedAt, requestId);
+      return res.changes;
+    },
   };
 
   public readonly auditLog = {
@@ -334,6 +437,52 @@ export class Repositories {
     },
     getLastEntry: (): AuditLogRow | undefined => {
       return this.db.prepare('SELECT * FROM audit_log ORDER BY rowid DESC LIMIT 1').get() as AuditLogRow | undefined;
+    },
+    list: (options?: { actor?: string; event?: string; requestId?: string; limit?: number; offset?: number }): AuditLogRow[] => {
+      const limit = Math.min(Math.max(1, options?.limit ?? 50), 100);
+      const offset = Math.max(0, options?.offset ?? 0);
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (options?.actor) {
+        conditions.push('actor = ?');
+        params.push(options.actor);
+      }
+      if (options?.event) {
+        conditions.push('event = ?');
+        params.push(options.event);
+      }
+      if (options?.requestId) {
+        conditions.push('request_id = ?');
+        params.push(options.requestId);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const sql = `SELECT * FROM audit_log ${whereClause} ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?`;
+      params.push(limit, offset);
+      return this.db.prepare(sql).all(...params) as AuditLogRow[];
+    },
+    count: (options?: { actor?: string; event?: string; requestId?: string }): number => {
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (options?.actor) {
+        conditions.push('actor = ?');
+        params.push(options.actor);
+      }
+      if (options?.event) {
+        conditions.push('event = ?');
+        params.push(options.event);
+      }
+      if (options?.requestId) {
+        conditions.push('request_id = ?');
+        params.push(options.requestId);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const sql = `SELECT COUNT(*) as c FROM audit_log ${whereClause}`;
+      const row = this.db.prepare(sql).get(...params) as { c: number } | undefined;
+      return row?.c ?? 0;
     },
   };
 

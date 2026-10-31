@@ -1,0 +1,19 @@
+================================================================================
+ACME CLOUD HOSTING SERVICES - OFFICIAL INVOICE
+================================================================================
+Invoice Number : INV-2026-10-8842
+Billing Date   : 2026-10-30
+Vendor Name    : Acme Cloud Hosting
+Vendor ID      : ven-acme
+Customer Ref   : cust-demo-acme
+--------------------------------------------------------------------------------
+Line Items:
+  1. Standard Micro Compute Node (1 Month) ................. $10.00 USD
+  2. Automated Database Backup Storage .................... $ 2.00 USD
+--------------------------------------------------------------------------------
+TOTAL DUE      : $12.00 USD
+Currency       : USD
+Payment Terms  : Net 30 Commercial
+Memo / Purpose : Acme Cloud compute infrastructure credits (Q4)
+================================================================================
+

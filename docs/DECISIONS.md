@@ -84,6 +84,12 @@ This document records the foundational decisions made for PayGuard. As spikes ar
 - **Decision**: Keep expiry handling strictly within the canonical milestone boundary: automated voiding and single `RELEASE` row generation remain scheduled for Milestone M4 (Task M4-T4: Expiry Worker and lazy expiry check on approval). `executeDecision` continues to treat expired requests as non-executable NO_OP, keeping budget reservations intact until explicitly voided via PayPal.
 - **Consequences**: No premature release of held funds; fail-closed budget protection is preserved across M2 and M3 without pulling M4 approval/worker scope forward.
 
+### D14: Owner Passphrase Hashing via Argon2id (@node-rs/argon2)
+- **Date**: 2026-10-30
+- **Context**: PLAN.md Section 13 mandates secure password hashing for owner credentials (preferring Argon2id). Standard C++ `argon2` bindings require `node-gyp` and native build tools on Windows, introducing environment fragility.
+- **Decision**: Adopt `@node-rs/argon2` providing precompiled native Rust N-API binaries for standard Argon2id hashing and verification (`$argon2id$...`), with automatic migration of legacy SHA-256 hashes upon successful authentication.
+- **Consequences**: Zero C++ compilation dependency, high security against GPU/ASIC brute force attacks, seamless hash upgrades.
+
 ---
 
 ## Dependency Justification Log
@@ -102,3 +108,7 @@ Per AGENTS.md rule 10, every external package dependency must have an explicit j
 | `zod` | dependency | Schema validation for policy documents, environment configuration, and MCP tool input payloads per PLAN.md Section 7. |
 | `better-sqlite3` | dependency | Embedded synchronous SQLite3 database driver for atomic transactions and local storage per PLAN.md Section 7 and Decision D2. |
 | `@types/better-sqlite3` | devDependency | TypeScript type definitions for better-sqlite3. |
+| `@modelcontextprotocol/sdk` | dependency | Official Model Context Protocol TypeScript SDK for server and transport implementation per PLAN.md Section 7. |
+| `express` | dependency | Minimal HTTP server for serving MCP over HTTP at /mcp per PLAN.md Section 7 and Decision D9. |
+| `@types/express` | devDependency | TypeScript type definitions for Express. |
+| `@node-rs/argon2` | dependency | Precompiled Argon2id password hashing and verification for owner authentication per PLAN.md Section 13 and Decision D14. |

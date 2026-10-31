@@ -36,7 +36,7 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       const freshDb = createDatabase(':memory:');
       const count = runMigrations(freshDb);
 
-      expect(count).toBe(2);
+      expect(count).toBe(3);
 
       const tables = freshDb
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC")
