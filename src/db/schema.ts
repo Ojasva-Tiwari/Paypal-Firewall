@@ -206,4 +206,17 @@ export const MIGRATIONS: readonly Migration[] = [
       END;
     `,
   },
+  {
+    version: 3,
+    name: '003_remote_void_tracking',
+    up: `
+      -- Durable remote void reconciliation status for payment requests
+      ALTER TABLE payment_requests
+        ADD COLUMN remote_void_status TEXT CHECK (remote_void_status IS NULL OR remote_void_status IN ('PENDING', 'CONFIRMED', 'FAILED'));
+
+      -- Index for rapid discovery of unconfirmed or failed remote voids
+      CREATE INDEX IF NOT EXISTS idx_payment_requests_remote_void
+        ON payment_requests(remote_void_status) WHERE remote_void_status IS NOT NULL;
+    `,
+  },
 ];

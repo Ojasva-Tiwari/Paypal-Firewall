@@ -35,6 +35,8 @@ import type {
   PayPalAuthorizationsService,
   PayPalAuthorizationDetails,
 } from './authorizations.js';
+import { AuthorizationError } from './authorizations.js';
+import { executeDecision, AmbiguousExecutionError } from '../core/executeDecision.js';
 import {
   transitionPaymentRequest,
   writeAuditLogEntry,
@@ -185,8 +187,12 @@ export async function reconcilePaymentRequest(
 
   const currentStatus = request.status as PaymentRequestStatus;
 
-  // 2. Terminal state guard: Already finalized, no-op
-  if (TERMINAL_STATUSES.has(currentStatus)) {
+  // 2. Terminal state guard: Already finalized, no-op (unless remote void is still pending or failed)
+  if (
+    TERMINAL_STATUSES.has(currentStatus) &&
+    request.remote_void_status !== 'PENDING' &&
+    request.remote_void_status !== 'FAILED'
+  ) {
     return {
       requestId,
       status: currentStatus,
@@ -533,6 +539,30 @@ export async function reconcilePaymentRequest(
         resolved: false,
         isUnresolved: true,
         reason: `Authorization lookup failed: ${errMsg}`,
+      };
+    }
+
+    if (!authDetails) {
+      writeAuditLogEntry(db, repos, {
+        actor,
+        event: 'RECONCILIATION_UNRESOLVED',
+        requestId,
+        timestamp: nowIso,
+        payload: {
+          reason: 'AUTHORIZATION_LOOKUP_EMPTY',
+          authId,
+        },
+      });
+
+      return {
+        requestId,
+        status: 'UNRESOLVED',
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: 'Authorization lookup returned no details',
       };
     }
 
@@ -1229,6 +1259,390 @@ export async function reconcilePaymentRequest(
       resolved: false,
       isUnresolved: true,
       reason: `Unexpected remote authorization status '${authSummary!.status}'`,
+    };
+  }
+
+  // ==========================================================================
+  // Flow C / Recovery: APPROVED Reconciliation (Orphaned approval crash recovery)
+  // ==========================================================================
+  if (currentStatus === 'APPROVED') {
+    const authId = request.paypal_authorization_id?.trim();
+    const expiresAt = request.expires_at ? new Date(request.expires_at).getTime() : 0;
+    const nowTime = now.getTime();
+
+    // Refinement 4: If hold expired while in APPROVED state
+    if (expiresAt > 0 && nowTime > expiresAt) {
+      // Expired! Never capture. Safely transition into terminal non-capturable state (FAILED).
+      // Release the reservation exactly once.
+      // Attempt remote authorization cancellation if authorization exists (outside DB transaction).
+      const terminalResult = runInTransaction(db, () => {
+        const ledgerEntries = repos.ledger.listByRequestId(requestId);
+        const hasSpend = ledgerEntries.some((l) => l.kind === 'SPEND');
+        if (hasSpend) {
+          throw new Error('Illegal ledger state: cannot fail request with existing SPEND entry');
+        }
+
+        const hasRelease = ledgerEntries.some((l) => l.kind === 'RELEASE');
+        let ledgerEntry: LedgerRow | undefined;
+        if (!hasRelease) {
+          ledgerEntry = {
+            id: `led-${crypto.randomUUID()}`,
+            request_id: requestId,
+            kind: 'RELEASE',
+            amount_minor: request.amount_minor,
+            currency: request.currency,
+            created_at: nowIso,
+          };
+          repos.ledger.insert(ledgerEntry);
+        }
+
+        const initialRemoteVoidStatus = authId ? 'PENDING' : 'FAILED';
+        const { auditEntry } = transitionPaymentRequest(db, repos, {
+          requestId,
+          to: 'FAILED',
+          actor,
+          event: 'TRANSITION_TO_FAILED',
+          timestamp: nowIso,
+          payload: {
+            reconciled: true,
+            reason: 'Hold expired while request was in APPROVED state (process crash recovery)',
+            remote_void_status: initialRemoteVoidStatus,
+          },
+        });
+
+        repos.paymentRequests.updateRemoteVoidStatus(requestId, initialRemoteVoidStatus, nowIso);
+
+        return { ledgerEntry, auditEntry, initialRemoteVoidStatus };
+      });
+
+      if (authId && options.authorizationsService) {
+        try {
+          const voidRes = await options.authorizationsService.voidAuthorization({
+            authorizationId: authId,
+            requestId,
+          });
+          if (voidRes.isVoided) {
+            repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
+            writeAuditLogEntry(db, repos, {
+              actor,
+              event: 'PAYPAL_VOID_CONFIRMED',
+              requestId,
+              timestamp: nowIso,
+              payload: { authorizationId: authId, reason: 'Voided expired authorization after crash recovery' },
+            });
+          }
+        } catch (err: unknown) {
+          writeAuditLogEntry(db, repos, {
+            actor,
+            event: 'PAYPAL_VOID_PENDING_RETRY',
+            requestId,
+            timestamp: nowIso,
+            payload: { error: err instanceof Error ? err.message : String(err), authorizationId: authId },
+          });
+        }
+      }
+
+      const finalReq = repos.paymentRequests.getById(requestId)!;
+      return {
+        requestId,
+        status: 'FAILED',
+        requestStatus: 'FAILED',
+        actionTaken: 'FAILED',
+        reconciled: true,
+        resolved: finalReq.remote_void_status === 'CONFIRMED',
+        isUnresolved: finalReq.remote_void_status !== 'CONFIRMED',
+        authorizationId: authId,
+        ledgerEntry: terminalResult.ledgerEntry,
+        auditEntry: terminalResult.auditEntry,
+        reason: 'Hold expired while request was in APPROVED state; transitioned to FAILED and released reservation',
+      };
+    }
+
+    // Unexpired APPROVED request: Recover through executeDecision() Flow C!
+    try {
+      const execution = await executeDecision(
+        { requestId },
+        {
+          db,
+          repos,
+          authorizationsService: options.authorizationsService,
+          ordersService: options.ordersService,
+          actor,
+          now,
+        }
+      );
+
+      const resolved = execution.status === 'CAPTURED' || execution.status === 'FAILED';
+      return {
+        requestId,
+        status: execution.status,
+        requestStatus: execution.status,
+        actionTaken: execution.executedAction as ReconcileActionTaken,
+        reconciled: resolved,
+        resolved,
+        isUnresolved: !resolved,
+        authorizationId: execution.authorizationId,
+        captureId: execution.captureId,
+        ledgerEntry: execution.ledgerEntry,
+        auditEntry: execution.auditEntry,
+      };
+    } catch (err: unknown) {
+      if (err instanceof AmbiguousExecutionError) {
+        return {
+          requestId,
+          status: 'CAPTURING',
+          requestStatus: 'CAPTURING',
+          actionTaken: 'NO_OP',
+          reconciled: false,
+          resolved: false,
+          isUnresolved: true,
+          reason: `Execution ambiguous: ${err.message}`,
+        };
+      }
+
+      writeAuditLogEntry(db, repos, {
+        actor,
+        event: 'RECONCILIATION_UNRESOLVED',
+        requestId,
+        timestamp: nowIso,
+        payload: { error: err instanceof Error ? err.message : String(err), status: currentStatus },
+      });
+
+      return {
+        requestId,
+        status: 'UNRESOLVED',
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: `Recovery execution failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  // ==========================================================================
+  // Flow D: Remote Void Reconciliation (PENDING or FAILED remote_void_status)
+  // ==========================================================================
+  if (
+    (currentStatus === 'VOIDED' || currentStatus === 'FAILED') &&
+    (request.remote_void_status === 'PENDING' || request.remote_void_status === 'FAILED')
+  ) {
+    const authId = request.paypal_authorization_id?.trim();
+    if (!authId) {
+      if (request.remote_void_status !== 'FAILED') {
+        repos.paymentRequests.updateRemoteVoidStatus(requestId, 'FAILED', nowIso);
+      }
+
+      // Check whether this unresolved condition has already been logged to prevent
+      // duplicate audit events on every reconciliation cycle.
+      const existingLogs = repos.auditLog.listByRequestId(requestId);
+      const alreadyLogged = existingLogs.some(
+        (log) => log.event === 'PAYPAL_VOID_UNRESOLVED_NO_AUTH_ID'
+      );
+
+      if (!alreadyLogged) {
+        writeAuditLogEntry(db, repos, {
+          actor,
+          event: 'PAYPAL_VOID_UNRESOLVED_NO_AUTH_ID',
+          requestId,
+          timestamp: nowIso,
+          payload: {
+            reason: 'Cannot cancel remote authorization: request is missing paypal_authorization_id',
+            remote_void_status: 'FAILED',
+          },
+        });
+      }
+
+      return {
+        requestId,
+        status: currentStatus,
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: 'Cannot cancel remote authorization: request is missing paypal_authorization_id',
+      };
+    }
+
+    if (!options.authorizationsService) {
+      return {
+        requestId,
+        status: 'UNRESOLVED',
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: 'PayPal authorizationsService not configured for remote void reconciliation',
+      };
+    }
+
+    // Inspect remote authorization status first
+    let authDetails: PayPalAuthorizationDetails | undefined;
+    try {
+      authDetails = await options.authorizationsService.getAuthorization(authId);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // For FAILED requests, avoid appending duplicate lookup failure logs on every cycle if unchanged
+      const shouldLog = (() => {
+        if (request.remote_void_status !== 'FAILED') return true;
+        const recentLogs = repos.auditLog.listByRequestId(requestId);
+        const lastLog = recentLogs[recentLogs.length - 1];
+        if (!lastLog || lastLog.event !== 'RECONCILIATION_UNRESOLVED') return true;
+        try {
+          const parsed = JSON.parse(lastLog.payload) as { reason?: string; error?: string };
+          return parsed.reason !== 'REMOTE_AUTHORIZATION_LOOKUP_FAILED' || parsed.error !== errMsg;
+        } catch {
+          return true;
+        }
+      })();
+
+      if (shouldLog) {
+        writeAuditLogEntry(db, repos, {
+          actor,
+          event: 'RECONCILIATION_UNRESOLVED',
+          requestId,
+          timestamp: nowIso,
+          payload: {
+            reason: 'REMOTE_AUTHORIZATION_LOOKUP_FAILED',
+            authorizationId: authId,
+            error: errMsg,
+          },
+        });
+      }
+
+      return {
+        requestId,
+        status: currentStatus,
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: `Remote authorization lookup failed: ${errMsg}`,
+      };
+    }
+
+    // Treat an already-VOIDED or EXPIRED remote authorization as successfully reconciled!
+    if (authDetails.status === 'VOIDED' || authDetails.status === 'EXPIRED') {
+      repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
+      const auditEntry = writeAuditLogEntry(db, repos, {
+        actor,
+        event: 'PAYPAL_VOID_RECONCILED',
+        requestId,
+        timestamp: nowIso,
+        payload: {
+          authorizationId: authId,
+          remote_status: authDetails.status,
+          remote_void_status: 'CONFIRMED',
+        },
+      });
+
+      return {
+        requestId,
+        status: currentStatus,
+        requestStatus: currentStatus,
+        actionTaken: 'VOIDED',
+        reconciled: true,
+        resolved: true,
+        isUnresolved: false,
+        authorizationId: authId,
+        auditEntry,
+        reason: `Remote authorization verified as ${authDetails.status}`,
+      };
+    }
+
+    // If remote state reports CAPTURED while local is VOIDED/FAILED:
+    if (authDetails.status === 'CAPTURED' || authDetails.isCaptured) {
+      writeAuditLogEntry(db, repos, {
+        actor,
+        event: 'RECONCILIATION_INTEGRITY_MISMATCH',
+        requestId,
+        timestamp: nowIso,
+        payload: {
+          reason: 'REMOTE_AUTHORIZATION_ALREADY_CAPTURED_FOR_VOIDED_REQUEST',
+          authorizationId: authId,
+        },
+      });
+
+      return {
+        requestId,
+        status: 'UNRESOLVED',
+        requestStatus: currentStatus,
+        actionTaken: 'NO_OP',
+        reconciled: false,
+        resolved: false,
+        isUnresolved: true,
+        reason: 'Contradictory state: remote authorization is CAPTURED but local request is VOIDED/FAILED',
+      };
+    }
+
+    // If remote state is CREATED:
+    // If request.remote_void_status is FAILED, do not blindly retry without operator intervention
+    // If request.remote_void_status is PENDING, attempt safe retry using voidAuthorization
+    if (request.remote_void_status === 'PENDING') {
+      try {
+        const voidRes = await options.authorizationsService.voidAuthorization({
+          authorizationId: authId,
+          requestId,
+        });
+
+        if (voidRes.isVoided) {
+          repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
+          const auditEntry = writeAuditLogEntry(db, repos, {
+            actor,
+            event: 'PAYPAL_VOID_RECONCILED',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              authorizationId: authId,
+              remote_void_status: 'CONFIRMED',
+            },
+          });
+
+          return {
+            requestId,
+            status: currentStatus,
+            requestStatus: currentStatus,
+            actionTaken: 'VOIDED',
+            reconciled: true,
+            resolved: true,
+            isUnresolved: false,
+            authorizationId: authId,
+            auditEntry,
+            reason: 'Remote authorization void confirmed via retry',
+          };
+        }
+      } catch (err: unknown) {
+        const isDefinitive = err instanceof AuthorizationError && (err.code === 'INVALID_REQUEST' || err.code === 'DECLINED');
+        if (isDefinitive) {
+          repos.paymentRequests.updateRemoteVoidStatus(requestId, 'FAILED', nowIso);
+          writeAuditLogEntry(db, repos, {
+            actor,
+            event: 'PAYPAL_VOID_FAILED',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              error: err instanceof Error ? err.message : String(err),
+              authorizationId: authId,
+              remote_void_status: 'FAILED',
+            },
+          });
+        }
+      }
+    }
+
+    return {
+      requestId,
+      status: currentStatus,
+      requestStatus: currentStatus,
+      actionTaken: 'NO_OP',
+      reconciled: false,
+      resolved: false,
+      isUnresolved: true,
+      reason: `Remote void reconciliation unresolved (status: ${request.remote_void_status}, remoteAuthStatus: ${authDetails.status})`,
     };
   }
 

@@ -53,6 +53,8 @@ export interface PolicyVersionRow {
   readonly created_at: string;
 }
 
+export type RemoteVoidStatus = 'PENDING' | 'CONFIRMED' | 'FAILED';
+
 export interface PaymentRequestRow {
   readonly id: string;
   readonly agent_id: string;
@@ -73,6 +75,7 @@ export interface PaymentRequestRow {
   readonly paypal_authorization_id: string | null;
   readonly paypal_capture_id: string | null;
   readonly expires_at: string | null;
+  readonly remote_void_status?: RemoteVoidStatus | null;
   readonly created_at: string;
   readonly updated_at: string;
 }

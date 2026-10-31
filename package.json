@@ -10,7 +10,13 @@
     "lint": "eslint .",
     "test:unit": "vitest run",
     "test": "npm run test:unit",
-    "build": "tsc"
+    "build": "tsc",
+    "agent:create": "tsx src/mcp/cli/createAgent.ts",
+    "demo:seed": "tsx demo/seed.ts",
+    "demo:reset": "tsx demo/reset.ts",
+    "demo:honest": "tsx demo/honestAgent.ts",
+    "demo:attack": "tsx demo/attackSimulator.ts",
+    "vault:onboard": "tsx demo/onboardVault.ts"
   },
   "keywords": [
     "paypal",
@@ -25,6 +31,7 @@
   "devDependencies": {
     "@eslint/js": "^9.20.0",
     "@types/better-sqlite3": "^9.6.0",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.13.1",
     "eslint": "^9.20.0",
     "tsx": "^4.19.2",
@@ -33,7 +40,10 @@
     "vitest": "^3.0.5"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@node-rs/argon2": "^2.2.2",
     "better-sqlite3": "^13.0.3",
+    "express": "^5.3.0",
     "zod": "^4.6.7"
   }
 }
