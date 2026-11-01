@@ -1,0 +1,160 @@
+@import "tailwindcss";
+
+:root,
+html.dark {
+  color-scheme: dark;
+  --app-bg: #050505;
+  --content-bg: #080808;
+  --sidebar-bg: #090909;
+  --card-bg: #111111;
+  --card-fg: #F2F2F0;
+  --elevated-bg: #171717;
+  --border-color: #262626;
+  --border-subtle: #1C1C1C;
+
+  --text-primary: #F2F2F0;
+  --text-secondary: #A0A0A0;
+  --text-muted: #696969;
+
+  --accent-sage: #B8D99A;
+  --accent-sage-hover: #A6C987;
+  --accent-lavender: #BBA9D8;
+  --accent-peach: #E8B5A0;
+
+  --status-error: #E5989B;
+  --status-error-bg: rgba(229, 152, 155, 0.12);
+  --status-error-border: rgba(229, 152, 155, 0.30);
+  --status-warn: #E8B5A0;
+  --status-warn-bg: rgba(232, 181, 160, 0.12);
+  --status-warn-border: rgba(232, 181, 160, 0.30);
+  --status-success: #B8D99A;
+  --status-success-bg: rgba(184, 217, 154, 0.15);
+  --status-success-border: rgba(184, 217, 154, 0.30);
+
+  --chart-grid: #262626;
+  --chart-empty-bar: #1F1F1F;
+
+  --dock-from: rgba(17, 17, 17, 0.98);
+  --dock-via: rgba(20, 20, 20, 0.90);
+  --dock-border: rgba(38, 38, 38, 0.60);
+  --unregistered-slot-from: #1C1C1C;
+  --unregistered-slot-to: #111111;
+
+  --scrollbar-track: #050505;
+  --scrollbar-thumb: #262626;
+  --scrollbar-thumb-hover: #333333;
+
+  --input-bg: #111111;
+  --input-border: #262626;
+}
+
+html.light {
+  color-scheme: light;
+  --app-bg: #F5F6F3;
+  --content-bg: #FAFAF8;
+  --sidebar-bg: #FFFFFF;
+  --card-bg: #FFFFFF;
+  --card-fg: #20231F;
+  --elevated-bg: #F0F1ED;
+  --border-color: #E3E5DF;
+  --border-subtle: #ECEEE9;
+
+  --text-primary: #20231F;
+  --text-secondary: #626960;
+  --text-muted: #858B82;
+
+  --accent-sage: #739B59;
+  --accent-sage-hover: #63884C;
+  --accent-lavender: #9882B9;
+  --accent-peach: #C98D75;
+
+  --status-error: #C95D63;
+  --status-error-bg: rgba(201, 93, 99, 0.10);
+  --status-error-border: rgba(201, 93, 99, 0.25);
+  --status-warn: #C98D75;
+  --status-warn-bg: rgba(201, 141, 117, 0.12);
+  --status-warn-border: rgba(201, 141, 117, 0.25);
+  --status-success: #739B59;
+  --status-success-bg: rgba(115, 155, 89, 0.12);
+  --status-success-border: rgba(115, 155, 89, 0.25);
+
+  --chart-grid: #E3E5DF;
+  --chart-empty-bar: #E8EAE4;
+
+  --dock-from: rgba(255, 255, 255, 0.98);
+  --dock-via: rgba(248, 248, 246, 0.90);
+  --dock-border: rgba(227, 229, 223, 0.80);
+  --unregistered-slot-from: #F0F1ED;
+  --unregistered-slot-to: #E3E5DF;
+
+  --scrollbar-track: #F5F6F3;
+  --scrollbar-thumb: #D1D4CC;
+  --scrollbar-thumb-hover: #BFC3B9;
+
+  --input-bg: #FFFFFF;
+  --input-border: #E3E5DF;
+}
+
+@theme {
+  --color-background: var(--app-bg);
+  --color-content: var(--content-bg);
+  --color-sidebar: var(--sidebar-bg);
+  --color-card: var(--card-bg);
+  --color-card-foreground: var(--card-fg);
+  --color-elevated: var(--elevated-bg);
+  --color-border: var(--border-color);
+
+  --color-primary: var(--accent-sage);
+  --color-primary-foreground: var(--app-bg);
+  --color-primary-hover: var(--accent-sage-hover);
+  --color-secondary: var(--elevated-bg);
+  --color-lavender: var(--accent-lavender);
+  --color-peach: var(--accent-peach);
+
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+
+  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+body {
+  margin: 0;
+  background-color: var(--app-bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Custom minimal scrollbar adapting to theme */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Accessibility: Support prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

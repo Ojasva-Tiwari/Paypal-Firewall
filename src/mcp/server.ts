@@ -14,6 +14,8 @@
  */
 
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import http, { type Server as HttpServer } from 'node:http';
 import express, { type Express } from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -177,6 +179,7 @@ export interface McpServerOptions {
   };
   readonly holdExpiryWorkerIntervalMs?: number; // default: 30,000 (30s)
   readonly reconcilerWorkerIntervalMs?: number; // default: 60,000 (60s)
+  readonly staticDir?: string;
 }
 
 export interface PayGuardMcpServerInstance {
@@ -468,6 +471,32 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       }
     }
   });
+
+  // Static frontend assets and SPA fallback
+  const staticDir = options.staticDir ?? path.resolve(process.cwd(), 'dist/web');
+  if (fs.existsSync(staticDir)) {
+    app.use(express.static(staticDir));
+    app.use((req, res, next) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return next();
+      }
+      // Never intercept API routes, approval links, MCP gateway, or health check
+      if (
+        req.path.startsWith('/api') ||
+        req.path.startsWith('/a') ||
+        req.path.startsWith('/mcp') ||
+        req.path === '/healthz'
+      ) {
+        return next();
+      }
+      const indexHtmlPath = path.join(staticDir, 'index.html');
+      if (fs.existsSync(indexHtmlPath)) {
+        res.sendFile(indexHtmlPath);
+      } else {
+        next();
+      }
+    });
+  }
 
   let activeHttpServer: HttpServer | null = null;
 
