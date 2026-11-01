@@ -112,3 +112,15 @@ Per AGENTS.md rule 10, every external package dependency must have an explicit j
 | `express` | dependency | Minimal HTTP server for serving MCP over HTTP at /mcp per PLAN.md Section 7 and Decision D9. |
 | `@types/express` | devDependency | TypeScript type definitions for Express. |
 | `@node-rs/argon2` | dependency | Precompiled Argon2id password hashing and verification for owner authentication per PLAN.md Section 13 and Decision D14. |
+| `react` | dependency | Declarative component framework for owner dashboard and approval UI per PLAN.md Section 7. |
+| `react-dom` | dependency | DOM renderer for React in the web dashboard per PLAN.md Section 7. |
+| `lucide-react` | dependency | Clean icon system for financial navigation and status badges per UI requirements. |
+| `clsx` | dependency | Class composition utility for UI styling without overhead. |
+| `vite` | devDependency | Frontend build tool and local dev server per PLAN.md Section 7. |
+| `@vitejs/plugin-react` | devDependency | Vite plugin for React JSX compilation and fast refresh. |
+| `@tailwindcss/vite` | devDependency | Official Vite plugin for Tailwind CSS v4 pipeline integration. |
+| `tailwindcss` | devDependency | Utility-first CSS engine for responsive styling and design tokens per PLAN.md Section 7. |
+| `postcss` | devDependency | CSS processing pipeline required for Tailwind. |
+| `autoprefixer` | devDependency | Automatic CSS vendor prefixing for modern browser compatibility. |
+| `@types/react` | devDependency | TypeScript definitions for React. |
+| `@types/react-dom` | devDependency | TypeScript definitions for React DOM. |
