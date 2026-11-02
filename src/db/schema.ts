@@ -219,4 +219,105 @@ export const MIGRATIONS: readonly Migration[] = [
         ON payment_requests(remote_void_status) WHERE remote_void_status IS NOT NULL;
     `,
   },
+  {
+    version: 4,
+    name: '004_ai_runs_cache_index',
+    up: `
+      -- Compound index for fast cache lookup on successful AI runs ordered by recency
+      CREATE INDEX IF NOT EXISTS idx_ai_runs_cache_lookup
+        ON ai_runs(input_hash, status, created_at DESC);
+    `,
+  },
+  {
+    version: 5,
+    name: '005_policy_proposals',
+    up: `
+      -- 11. Policy Proposals
+      CREATE TABLE IF NOT EXISTS policy_proposals (
+        id TEXT PRIMARY KEY,
+        base_version INTEGER NOT NULL,
+        rules TEXT NOT NULL,
+        proposal_hash TEXT NOT NULL,
+        has_relaxations INTEGER NOT NULL CHECK (has_relaxations IN (0, 1)),
+        relaxations TEXT NOT NULL,
+        diff TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        unsupported_requests TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('PENDING', 'ACTIVATED', 'REJECTED', 'EXPIRED')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        activated_at TEXT,
+        rejected_at TEXT
+      );
+
+      -- Rapid lookup for active proposals by status and expiry
+      CREATE INDEX IF NOT EXISTS idx_policy_proposals_status_expires
+        ON policy_proposals(status, expires_at);
+
+      -- Immutability & tamper-proof triggers for policy_proposals
+      CREATE TRIGGER IF NOT EXISTS policy_proposals_prevent_tamper
+      BEFORE UPDATE ON policy_proposals
+      FOR EACH ROW
+      WHEN (
+        OLD.id IS NOT NEW.id OR
+        OLD.base_version IS NOT NEW.base_version OR
+        OLD.rules IS NOT NEW.rules OR
+        OLD.proposal_hash IS NOT NEW.proposal_hash OR
+        OLD.has_relaxations IS NOT NEW.has_relaxations OR
+        OLD.relaxations IS NOT NEW.relaxations OR
+        OLD.diff IS NOT NEW.diff OR
+        OLD.explanation IS NOT NEW.explanation OR
+        OLD.unsupported_requests IS NOT NEW.unsupported_requests OR
+        OLD.owner_id IS NOT NEW.owner_id OR
+        OLD.created_at IS NOT NEW.created_at OR
+        OLD.expires_at IS NOT NEW.expires_at OR
+        OLD.status != 'PENDING' OR
+        NEW.status NOT IN ('ACTIVATED', 'REJECTED')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'policy_proposals is tamper-proof: only status transition from PENDING is permitted, and core rules cannot be modified');
+      END;
+    `,
+  },
+  {
+    version: 6,
+    name: '006_harden_proposal_triggers',
+    up: `
+      -- Replace proposal tamper trigger with hardened state-transition and timestamp consistency rules
+      DROP TRIGGER IF EXISTS policy_proposals_prevent_tamper;
+
+      CREATE TRIGGER IF NOT EXISTS policy_proposals_prevent_tamper
+      BEFORE UPDATE ON policy_proposals
+      FOR EACH ROW
+      WHEN (
+        OLD.id IS NOT NEW.id OR
+        OLD.base_version IS NOT NEW.base_version OR
+        OLD.rules IS NOT NEW.rules OR
+        OLD.proposal_hash IS NOT NEW.proposal_hash OR
+        OLD.has_relaxations IS NOT NEW.has_relaxations OR
+        OLD.relaxations IS NOT NEW.relaxations OR
+        OLD.diff IS NOT NEW.diff OR
+        OLD.explanation IS NOT NEW.explanation OR
+        OLD.unsupported_requests IS NOT NEW.unsupported_requests OR
+        OLD.owner_id IS NOT NEW.owner_id OR
+        OLD.created_at IS NOT NEW.created_at OR
+        OLD.expires_at IS NOT NEW.expires_at OR
+        OLD.status != 'PENDING' OR
+        NEW.status NOT IN ('ACTIVATED', 'REJECTED', 'EXPIRED') OR
+        (NEW.status = 'ACTIVATED' AND (NEW.activated_at IS NULL OR NEW.rejected_at IS NOT NULL)) OR
+        (NEW.status = 'REJECTED' AND (NEW.rejected_at IS NULL OR NEW.activated_at IS NOT NULL)) OR
+        (NEW.status = 'EXPIRED' AND (NEW.activated_at IS NOT NULL OR NEW.rejected_at IS NOT NULL))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'policy_proposals is tamper-proof: only valid transitions from PENDING with consistent timestamps are permitted, and core rules/hashes cannot be modified');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS policy_proposals_prevent_delete
+      BEFORE DELETE ON policy_proposals
+      BEGIN
+        SELECT RAISE(ABORT, 'policy_proposals is append-only: DELETE operations are strictly prohibited');
+      END;
+    `,
+  },
 ];

@@ -31,6 +31,7 @@ import { evaluatePolicy } from '../policy/engine.js';
 import { gatherFacts } from './facts.js';
 import {
   transitionPaymentRequest,
+  writeAuditLogEntry,
   type PaymentRequestStatus,
 } from './stateMachine.js';
 
@@ -159,6 +160,7 @@ export interface EvaluateAndReserveParams {
   readonly aiFlags?: readonly string[];
   readonly now?: Date;
   readonly requestId?: string;
+  readonly autoExecute?: boolean;
 }
 
 export interface EvaluateAndReserveResult {
@@ -317,19 +319,58 @@ export function evaluateAndReserve(
     let snapshotHash: string | null = null;
     let expiresAt: string | null = null;
 
+    const autoExecute = params.autoExecute ?? true;
+
     if (evaluation.decision === 'ALLOW') {
-      // Flow A: Insert RESERVE ledger row, transition RECEIVED -> AUTO_EXECUTING
-      const ledgerId = `led-${crypto.randomUUID()}`;
-      ledgerEntry = {
-        id: ledgerId,
-        request_id: requestId,
-        kind: 'RESERVE',
-        amount_minor: params.amountMinor,
-        currency: params.currency,
-        created_at: nowIso,
-      };
-      repos.ledger.insert(ledgerEntry);
-      targetStatus = 'AUTO_EXECUTING';
+      if (autoExecute) {
+        // Flow A: Insert RESERVE ledger row, transition RECEIVED -> AUTO_EXECUTING
+        const ledgerId = `led-${crypto.randomUUID()}`;
+        ledgerEntry = {
+          id: ledgerId,
+          request_id: requestId,
+          kind: 'RESERVE',
+          amount_minor: params.amountMinor,
+          currency: params.currency,
+          created_at: nowIso,
+        };
+        repos.ledger.insert(ledgerEntry);
+        targetStatus = 'AUTO_EXECUTING';
+      } else {
+        // Local evaluation mode (autoExecute = false):
+        // Persist decision and reasons, keep status 'RECEIVED', do not create RESERVE ledger row.
+        repos.paymentRequests.updateStatusAndDecision(requestId, {
+          status: 'RECEIVED',
+          decision: 'ALLOW',
+          reasons: JSON.stringify(evaluation.reasons),
+          updatedAt: nowIso,
+        });
+
+        const auditEntry = writeAuditLogEntry(db, repos, {
+          actor: 'agent',
+          event: 'POLICY_EVALUATION_ALLOW',
+          requestId,
+          timestamp: nowIso,
+          payload: {
+            amount_minor: params.amountMinor.toString(),
+            currency: params.currency,
+            vendor_id: params.vendorId,
+            rules_triggered: evaluation.ruleIds,
+            decision: 'ALLOW',
+            status: 'RECEIVED',
+            auto_execute: false,
+          },
+        });
+
+        const updatedRequest = repos.paymentRequests.getById(requestId)!;
+        return {
+          request: updatedRequest,
+          decision: evaluation.decision,
+          reasons: evaluation.reasons,
+          isIdempotentReplay: false,
+          auditEntry,
+          ledgerEntry: undefined,
+        };
+      }
     } else if (evaluation.decision === 'HOLD') {
       // Flow B: Insert RESERVE ledger row, compute snapshot_hash, calculate expires_at, transition RECEIVED -> HELD
       const ledgerId = `led-${crypto.randomUUID()}`;

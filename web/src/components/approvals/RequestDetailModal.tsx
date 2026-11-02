@@ -194,10 +194,76 @@ export function RequestDetailModal({ isOpen, requestId, onClose }: RequestDetail
                         </span>
                       ))}
                     </div>
+
+                    {detail.explanation?.items && detail.explanation.items.length > 0 && (
+                      <div className="space-y-2 pt-2 border-t border-[var(--border-color)]">
+                        {detail.explanation.items.map((item, idx) => (
+                          <div
+                            key={item.code || idx}
+                            className="p-2.5 rounded-lg bg-[var(--card-bg)] border border-[var(--border-color)] text-xs space-y-1"
+                          >
+                            <div className="flex items-center justify-between font-mono">
+                              <span className="font-semibold text-[var(--text-primary)]">{item.title}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-semibold border ${
+                                item.severity === 'DENY'
+                                  ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                                  : item.severity === 'HOLD'
+                                  ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                                  : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              }`}>
+                                {item.severity}
+                              </span>
+                            </div>
+                            <p className="text-[var(--text-secondary)] text-[11px] leading-relaxed">
+                              {item.description}
+                            </p>
+                            <div className="text-[10px] text-[var(--text-secondary)] pt-1">
+                              <span className="font-semibold text-[var(--text-primary)]">Action: </span>
+                              {item.recommendedAction}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
-                {aiReasons.length > 0 && (
+                {detail.aiRiskExplanation && (
+                  <div className="rounded-xl bg-[#BBA9D8]/5 border border-[#BBA9D8]/20 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-[#BBA9D8] flex items-center gap-1.5">
+                        <Sparkles className="h-3.5 w-3.5" />
+                        AI Risk Explainer ({detail.aiRiskExplanation.isMock ? 'Mock Advisory (Test Mode)' : 'Advisory'})
+                      </span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold font-mono border ${
+                        detail.aiRiskExplanation.risk_level === 'HIGH'
+                          ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                          : detail.aiRiskExplanation.risk_level === 'MEDIUM'
+                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                      }`}>
+                        {detail.aiRiskExplanation.risk_level} RISK
+                      </span>
+                    </div>
+                    <p className="text-xs text-[var(--text-primary)] leading-relaxed">
+                      {detail.aiRiskExplanation.summary}
+                    </p>
+                    {detail.aiRiskExplanation.suspicious_phrases && detail.aiRiskExplanation.suspicious_phrases.length > 0 && (
+                      <div className="flex flex-wrap gap-1 pt-1">
+                        {detail.aiRiskExplanation.suspicious_phrases.map((phrase, i) => (
+                          <span key={i} className="px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-300 border border-rose-500/20 font-mono text-[10px]">
+                            {phrase}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div className="text-[10px] text-[var(--text-secondary)] font-mono pt-0.5">
+                      Model: {detail.aiRiskExplanation.model} • Advisory only (Hard Rule 6: cannot override policy)
+                    </div>
+                  </div>
+                )}
+
+                {aiReasons.length > 0 && !detail.aiRiskExplanation && (
                   <div className="rounded-xl bg-[#BBA9D8]/5 border border-[#BBA9D8]/20 p-4 space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold text-[#BBA9D8] flex items-center gap-1.5">

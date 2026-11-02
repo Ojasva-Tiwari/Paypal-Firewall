@@ -13,8 +13,10 @@
 
 import { z } from 'zod';
 import { MAX_MINOR_UNITS, toMinorUnits, type MinorUnits } from '../core/money.js';
+import { DEFAULT_GEMINI_MODEL } from '../ai/types.js';
 
 export const SANDBOX_BASE_URL = 'https://api-m.sandbox.paypal.com';
+export const DEFAULT_AI_MODEL = DEFAULT_GEMINI_MODEL;
 
 export class ConfigError extends Error {
   public readonly issues?: z.ZodIssue[];
@@ -54,7 +56,7 @@ export interface PayGuardConfig {
   readonly aiProvider: 'gemini' | 'mock';
   readonly aiModel: string;
   readonly geminiApiKey?: string;
-  readonly aiScanMode: 'advisory' | 'enforce';
+  readonly aiScanMode: 'off' | 'advisory' | 'enforce';
   readonly telegramBotToken?: string;
   readonly telegramOwnerChatId?: string;
 }
@@ -133,9 +135,9 @@ const RawEnvSchema = z
     DEMO_AGENT_API_KEY: z.string().optional(),
     VAULT_TOKEN_ID: z.string().optional(),
     AI_PROVIDER: z.enum(['gemini', 'mock'] as const).default('mock'),
-    AI_MODEL: z.string().min(1, 'AI_MODEL cannot be empty').default('gemini-1.5-flash'),
+    AI_MODEL: z.string().min(1, 'AI_MODEL cannot be empty').default(DEFAULT_AI_MODEL),
     GEMINI_API_KEY: z.string().optional(),
-    AI_SCAN_MODE: z.enum(['advisory', 'enforce'] as const).default('advisory'),
+    AI_SCAN_MODE: z.enum(['off', 'advisory', 'enforce'] as const).default('advisory'),
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_OWNER_CHAT_ID: z.string().optional(),
   })

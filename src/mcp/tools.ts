@@ -38,6 +38,80 @@ import { executeDecision, type ExecuteDecisionOptions } from '../core/executeDec
 import { getRollingBudgets } from '../core/facts.js';
 import { getAuthenticatedAgent } from './auth.js';
 import type { PolicyDocument } from '../policy/types.js';
+import type { PayGuardConfig } from '../config/index.js';
+import type { AiService } from '../ai/service.js';
+import { InjectionDetector, type InjectionDetectionResult } from '../ai/injectionDetector.js';
+import { writeAuditLogEntry } from '../core/stateMachine.js';
+import * as crypto from 'node:crypto';
+
+export interface RequestPaymentHandlerOptions extends ExecuteDecisionOptions {
+  readonly config?: PayGuardConfig;
+  readonly aiService?: AiService;
+  readonly injectionDetector?: InjectionDetector;
+}
+
+interface ScanAuditParams {
+  readonly outcome: string;
+  readonly method: string;
+  readonly attackCategories: readonly string[];
+  readonly explanation: string;
+  readonly scanMode: string;
+  readonly timestamp: string;
+  readonly inputHash: string;
+}
+
+/**
+ * Persists heuristic and AI injection detection results safely into existing DB tables
+ * (ai_runs and audit_log) in both advisory and enforce modes.
+ */
+function safePersistScanAudit(
+  db: Database,
+  repos: Repositories,
+  params: ScanAuditParams
+): void {
+  try {
+    // 1. If heuristic method, record in ai_runs table
+    if (params.method === 'HEURISTIC') {
+      const runId = `airun-heur-${crypto.randomUUID()}`;
+      repos.aiRuns.insert({
+        id: runId,
+        kind: 'injection_detection_heuristic',
+        request_id: null,
+        model: 'deterministic-heuristics',
+        input_hash: params.inputHash,
+        output: JSON.stringify({
+          outcome: params.outcome,
+          method: params.method,
+          attack_categories: params.attackCategories,
+          explanation: params.explanation,
+          scan_mode: params.scanMode,
+          timestamp: params.timestamp,
+        }),
+        latency_ms: 0,
+        status: params.outcome === 'DETECTED' ? 'DETECTED' : 'CLEAR',
+        created_at: params.timestamp,
+      });
+    }
+
+    // 2. If injection was DETECTED (in either advisory or enforce mode), append to audit_log
+    if (params.outcome === 'DETECTED') {
+      writeAuditLogEntry(db, repos, {
+        actor: 'ai',
+        event: 'PROMPT_INJECTION_DETECTED',
+        payload: {
+          outcome: params.outcome,
+          method: params.method,
+          attack_categories: params.attackCategories,
+          explanation: params.explanation,
+          scan_mode: params.scanMode,
+          timestamp: params.timestamp,
+        },
+      });
+    }
+  } catch {
+    // Fail-safe: persistence failure never blocks transaction or leaks secrets
+  }
+}
 
 // ============================================================================
 // Tool Result Interface
@@ -144,6 +218,9 @@ function getNextStep(decision: string | null, status: string): string {
   if (status === 'FAILED') {
     return 'Payment execution failed. Do not retry automatically.';
   }
+  if (decision === 'ALLOW' && status === 'RECEIVED') {
+    return 'Payment request evaluated and approved (local evaluation mode; remote capture skipped).';
+  }
   return 'Payment request submitted.';
 }
 
@@ -155,7 +232,7 @@ export async function handleRequestPayment(
   db: Database,
   args: unknown,
   repositories?: Repositories,
-  options?: ExecuteDecisionOptions
+  options?: RequestPaymentHandlerOptions
 ): Promise<ToolResult> {
   const parseResult = requestPaymentInputSchema.safeParse(args);
   if (!parseResult.success) {
@@ -194,7 +271,69 @@ export async function handleRequestPayment(
     };
   }
 
-  // 1. Transactional evaluation and reservation (Flow A, B, E)
+  const autoExecute = Boolean(options?.ordersService);
+
+  // 1. Idempotency pre-check: skip AI scanning on identical replays to protect quota/latency
+  const existingForReplay = repos.paymentRequests.getByAgentAndIdempotencyKey(
+    agentId,
+    input.idempotency_key
+  );
+  const isIdempotentMatch =
+    existingForReplay &&
+    existingForReplay.vendor_id === input.vendor_id &&
+    existingForReplay.amount_minor === amountMinor &&
+    existingForReplay.currency === input.currency &&
+    existingForReplay.purpose === input.purpose &&
+    (existingForReplay.category ?? null) === (input.category ?? null);
+
+  // 2. Prompt Injection Scanning (M5-T5)
+  // AI_SCAN_MODE = off | advisory | enforce (default: advisory)
+  const scanMode = options?.config?.aiScanMode ?? 'advisory';
+  let aiFlags: string[] | undefined;
+  let injectionResult: InjectionDetectionResult | undefined;
+
+  if (!isIdempotentMatch && scanMode !== 'off') {
+    try {
+      const vendorRow = repos.vendors.getById(input.vendor_id);
+      const detector =
+        options?.injectionDetector ?? new InjectionDetector(options?.aiService);
+      injectionResult = await detector.scan({
+        purpose: input.purpose,
+        sourceContext: input.source_context,
+        vendorName: vendorRow?.name,
+      });
+
+      // G3: Persist scan audit records safely into ai_runs and audit_log
+      safePersistScanAudit(db, repos, {
+        outcome: injectionResult.outcome,
+        method: injectionResult.method,
+        attackCategories: injectionResult.attackCategories,
+        explanation: injectionResult.explanation.slice(0, 300),
+        scanMode,
+        timestamp: new Date().toISOString(),
+        inputHash: crypto
+          .createHash('sha256')
+          .update(
+            `${input.purpose}\n${input.source_context || ''}\n${vendorRow?.name || ''}`,
+            'utf8'
+          )
+          .digest('hex'),
+      });
+
+      if (scanMode === 'enforce') {
+        if (injectionResult.outcome === 'DETECTED') {
+          aiFlags = ['PROMPT_INJECTION_DETECTED'];
+        }
+      }
+      // Advisory mode: scan runs and persists, but aiFlags remains undefined (never alters deterministic policy)
+      // Indeterminate result: aiFlags remains undefined (baseline deterministic safety stands)
+    } catch {
+      // Fail-open for AI scan errors: baseline safety never depends on AI being up
+      aiFlags = undefined;
+    }
+  }
+
+  // 3. Transactional evaluation and reservation (Flow A, B, E)
   let evalResult;
   try {
     evalResult = evaluateAndReserve(
@@ -208,6 +347,8 @@ export async function handleRequestPayment(
         category: input.category,
         idempotencyKey: input.idempotency_key,
         sourceContext: input.source_context,
+        autoExecute,
+        aiFlags,
       },
       repos
     );
@@ -272,17 +413,22 @@ export async function handleRequestPayment(
   const reasons = [...evalResult.reasons];
 
   if (decision === 'ALLOW') {
-    // Flow A: Auto-execute CAPTURE via executeDecision
-    try {
-      const execRes = await executeDecision(
-        { requestId: evalResult.request.id },
-        { db, repos, ...options }
-      );
-      currentStatus = execRes.status;
-    } catch {
-      // Re-read authoritative status from database after failure/ambiguity
-      const updated = repos.paymentRequests.getById(evalResult.request.id);
-      currentStatus = updated?.status ?? 'FAILED';
+    if (autoExecute && options?.ordersService) {
+      // Flow A: Auto-execute CAPTURE via executeDecision
+      try {
+        const execRes = await executeDecision(
+          { requestId: evalResult.request.id },
+          { db, repos, ...options }
+        );
+        currentStatus = execRes.status;
+      } catch {
+        // Re-read authoritative status from database after failure/ambiguity
+        const updated = repos.paymentRequests.getById(evalResult.request.id);
+        currentStatus = updated?.status ?? 'FAILED';
+      }
+    } else {
+      // Local evaluation mode: remote capture skipped, status remains 'RECEIVED'
+      currentStatus = 'RECEIVED';
     }
   } else if (decision === 'HOLD') {
     // Flow B: Authorize hold established via executeDecision if PayPal ordersService configured
@@ -308,6 +454,8 @@ export async function handleRequestPayment(
     userMessage = 'Payment denied by policy firewall.';
   } else if (currentStatus === 'FAILED') {
     userMessage = 'Payment execution failed on PayPal sandbox.';
+  } else if (decision === 'ALLOW' && currentStatus === 'RECEIVED') {
+    userMessage = 'Payment evaluated and approved by policy firewall (local evaluation mode; remote capture skipped).';
   }
 
   const responsePayload = {

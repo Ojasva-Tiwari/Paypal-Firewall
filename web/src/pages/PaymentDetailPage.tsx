@@ -15,6 +15,7 @@ import {
   Activity,
   Layers,
   ShieldAlert,
+  Sparkles,
 } from 'lucide-react';
 import {
   PaymentRequestDetail,
@@ -451,6 +452,91 @@ export function PaymentDetailPage({ requestId, onBack }: PaymentDetailPageProps)
                     {getReasonLabel(code)}
                   </span>
                 ))}
+              </div>
+
+              {detail.explanation?.items && detail.explanation.items.length > 0 && (
+                <div className="space-y-2.5 pt-2 border-t border-[var(--border-color)]">
+                  {detail.explanation.items.map((item, idx) => (
+                    <div
+                      key={item.code || idx}
+                      className="p-3.5 rounded-xl bg-[var(--elevated-bg)] border border-[var(--border-color)] text-xs space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between font-mono">
+                        <span className="font-semibold text-[var(--text-primary)]">{item.title}</span>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                          item.severity === 'DENY'
+                            ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                            : item.severity === 'HOLD'
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                            : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                        }`}>
+                          {item.severity}
+                        </span>
+                      </div>
+                      <p className="text-[var(--text-secondary)] leading-relaxed">
+                        {item.description}
+                      </p>
+                      <div className="text-[11px] text-[var(--text-secondary)] pt-1 border-t border-[var(--border-color)]/50">
+                        <span className="font-semibold text-[var(--text-primary)]">Recommended Action: </span>
+                        {item.recommendedAction}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* AI Risk Explanation (M5-T3 Advisory) */}
+          {detail.aiRiskExplanation && (
+            <div className="rounded-2xl bg-[var(--card-bg)] border border-[#BBA9D8]/30 p-6 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-[#BBA9D8] flex items-center gap-1.5">
+                    <Sparkles className="h-4 w-4" />
+                    AI Risk Explainer (Advisory)
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded border border-[var(--border-color)] bg-[var(--elevated-bg)] text-[var(--text-secondary)]">
+                    {detail.aiRiskExplanation.isMock ? 'Mock Advisory (Test Mode)' : 'Non-Authoritative'}
+                  </span>
+                </div>
+                <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold font-mono border self-start sm:self-auto ${
+                  detail.aiRiskExplanation.risk_level === 'HIGH'
+                    ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                    : detail.aiRiskExplanation.risk_level === 'MEDIUM'
+                    ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                    : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                }`}>
+                  {detail.aiRiskExplanation.risk_level} RISK
+                </span>
+              </div>
+
+              <div className="p-4 rounded-xl bg-[var(--elevated-bg)] border border-[var(--border-color)] text-xs space-y-2.5">
+                <p className="text-[var(--text-primary)] leading-relaxed">
+                  {detail.aiRiskExplanation.summary}
+                </p>
+
+                {detail.aiRiskExplanation.suspicious_phrases && detail.aiRiskExplanation.suspicious_phrases.length > 0 && (
+                  <div className="pt-2 border-t border-[var(--border-color)]/60">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--text-secondary)] block mb-1.5">
+                      Flagged Phrases
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {detail.aiRiskExplanation.suspicious_phrases.map((phrase, i) => (
+                        <span
+                          key={i}
+                          className="px-2 py-0.5 rounded bg-rose-500/10 text-rose-300 border border-rose-500/20 font-mono text-[11px]"
+                        >
+                          {phrase}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="text-[10px] text-[var(--text-secondary)] font-mono pt-1">
+                  Model: {detail.aiRiskExplanation.model} • Advisory only (Hard Rule 6: cannot override policy)
+                </div>
               </div>
             </div>
           )}

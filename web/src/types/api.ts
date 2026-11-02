@@ -232,6 +232,30 @@ export interface PaymentApprovalItem {
   createdAt: string;
 }
 
+export interface PolicyExplanationItem {
+  code: string;
+  title: string;
+  description: string;
+  severity: 'DENY' | 'HOLD' | 'INFO';
+  ruleId?: string;
+  recommendedAction: string;
+}
+
+export interface PolicyDecisionExplanation {
+  decision: 'ALLOW' | 'HOLD' | 'DENY';
+  summary: string;
+  items: PolicyExplanationItem[];
+  nextSteps: string;
+}
+
+export interface AiRiskExplanationResponse {
+  summary: string;
+  suspicious_phrases: string[];
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH';
+  isMock: boolean;
+  model: string;
+}
+
 export interface PaymentRequestDetail {
   id: string;
   agent: {
@@ -253,6 +277,8 @@ export interface PaymentRequestDetail {
   status: string;
   decision: string | null;
   reasons: string[];
+  explanation?: PolicyDecisionExplanation;
+  aiRiskExplanation?: AiRiskExplanationResponse | null;
   policyVersionId: string | null;
   paypalOrderId: string | null;
   paypalAuthorizationId: string | null;
@@ -265,4 +291,84 @@ export interface PaymentRequestDetail {
   ledger: PaymentLedgerItem[];
   approvals: PaymentApprovalItem[];
 }
+
+export type ProposalStatus = 'PENDING' | 'ACTIVATED' | 'REJECTED' | 'EXPIRED';
+export type DiffChangeType = 'TIGHTENED' | 'RELAXED' | 'UNCHANGED';
+
+export interface PolicyDiffItem {
+  field: string;
+  change?: DiffChangeType;
+  changeType?: DiffChangeType;
+  label?: string;
+  activeValue?: unknown;
+  proposedValue?: unknown;
+  explanation: string;
+  isRelaxation?: boolean;
+}
+
+export interface PolicyProposalSummary {
+  id: string;
+  baseVersion: number;
+  rules: Record<string, unknown>;
+  proposalHash: string;
+  hasRelaxations: boolean;
+  relaxations: string[];
+  diff: PolicyDiffItem[];
+  explanation: string;
+  unsupportedRequests: string[];
+  ownerId?: string;
+  status: ProposalStatus;
+  createdAt: string;
+  expiresAt: string;
+  activatedAt?: string | null;
+  rejectedAt?: string | null;
+}
+
+export interface PolicyProposalDetail extends PolicyProposalSummary {
+  metadata?: {
+    model: string;
+    prompt: string;
+    generatedAt: string;
+  };
+}
+
+export interface PolicyDraftsResponse {
+  drafts: PolicyProposalSummary[];
+  total: number;
+}
+
+export interface DraftPolicyInput {
+  prompt: string;
+  ttlMinutes?: number;
+}
+
+export interface ActivateProposalInput {
+  proposalHash?: string;
+  acknowledgeRelaxations?: boolean;
+}
+
+export interface ActivateProposalResponse {
+  success: boolean;
+  id: string;
+  version: number;
+  rules: Record<string, unknown>;
+  author: string;
+  active: boolean;
+  createdAt: string;
+  proposalId: string;
+  policy: PolicySummary;
+}
+
+export interface RejectProposalInput {
+  reason?: string;
+}
+
+export interface RejectProposalResponse {
+  success: boolean;
+  proposalId: string;
+  status: 'REJECTED';
+  rejectedAt: string;
+  reason: string;
+}
+
 

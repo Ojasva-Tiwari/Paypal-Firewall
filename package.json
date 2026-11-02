@@ -19,6 +19,7 @@
     "demo:reset": "tsx demo/reset.ts",
     "demo:honest": "tsx demo/honestAgent.ts",
     "demo:attack": "tsx demo/attackSimulator.ts",
+    "demo:live": "tsx demo/liveAgent.ts",
     "vault:onboard": "tsx demo/onboardVault.ts"
   },
   "keywords": [

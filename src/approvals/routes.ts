@@ -49,6 +49,13 @@ import {
 } from './tokens.js';
 import { expirePaymentHold } from './expiry.js';
 import * as crypto from 'node:crypto';
+import {
+  explainPolicyDecision,
+  type PolicyExplanationItem,
+} from '../policy/explanations.js';
+import type { Decision } from '../policy/types.js';
+import type { AiService } from '../ai/service.js';
+import { RiskExplainer, type AiRiskExplanationResponse } from '../ai/riskExplainer.js';
 
 // ============================================================================
 // Types & Interfaces
@@ -60,6 +67,7 @@ export interface ApprovalRouterOptions {
   readonly sessionStore: OwnerSessionStore;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly ordersService?: PayPalOrdersService;
+  readonly aiService?: AiService;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -83,6 +91,8 @@ export interface ApprovalReviewData {
   readonly purpose: string;
   readonly category: string | null;
   readonly policyReasons: readonly string[];
+  readonly explanations?: readonly PolicyExplanationItem[];
+  readonly aiRiskExplanation?: AiRiskExplanationResponse | null;
   readonly sourceContextExcerpt: string | null;
   readonly expiresAt: string;
   readonly holdExpiresAt: string | null;
@@ -168,7 +178,44 @@ function renderApprovalHtml(data: ApprovalReviewData, token: string, csrfToken: 
       <div class="reasons">
         ${data.policyReasons.map((r) => `<span class="reason-tag">${escapeHtml(r)}</span>`).join('')}
       </div>
+      ${data.explanations && data.explanations.length > 0 ? `
+      <div style="margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;">
+        ${data.explanations.map((exp) => `
+          <div style="background: #0f172a; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.6rem 0.75rem; font-size: 0.8rem;">
+            <div style="font-weight: 600; color: #f8fafc; margin-bottom: 0.2rem;">${escapeHtml(exp.title)}</div>
+            <div style="color: #cbd5e1; line-height: 1.35; margin-bottom: 0.35rem;">${escapeHtml(exp.description)}</div>
+            <div style="font-size: 0.75rem; color: #94a3b8;"><strong style="color: #64748b;">Recommended Action:</strong> ${escapeHtml(exp.recommendedAction)}</div>
+          </div>
+        `).join('')}
+      </div>` : ''}
     </div>
+
+    ${data.aiRiskExplanation ? `
+    <div class="field" style="margin-top: 1.25rem;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+        <div class="label" style="margin-bottom: 0; color: #a78bfa;">
+          AI Risk Explainer (${data.aiRiskExplanation.isMock ? 'Mock Advisory - Test Mode' : 'Advisory - Non-Authoritative'})
+        </div>
+        <span class="badge" style="background: ${
+          data.aiRiskExplanation.risk_level === 'HIGH' ? '#dc2626' : data.aiRiskExplanation.risk_level === 'MEDIUM' ? '#d97706' : '#059669'
+        }; color: #ffffff;">
+          ${escapeHtml(data.aiRiskExplanation.risk_level)} RISK
+        </span>
+      </div>
+      <div style="background: #1e1b4b; border: 1px solid #4338ca; border-radius: 0.5rem; padding: 0.75rem; font-size: 0.85rem; line-height: 1.4; color: #e0e7ff;">
+        <div>${escapeHtml(data.aiRiskExplanation.summary)}</div>
+        ${data.aiRiskExplanation.suspicious_phrases && data.aiRiskExplanation.suspicious_phrases.length > 0 ? `
+        <div style="margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #3730a3; font-size: 0.75rem;">
+          <strong style="color: #c7d2fe;">Flagged Phrases:</strong>
+          <div style="margin-top: 0.25rem;">
+            ${data.aiRiskExplanation.suspicious_phrases.map((p) => `<span class="reason-tag" style="background: #312e81; color: #fca5a5; border: 1px solid #4338ca;">${escapeHtml(p)}</span>`).join('')}
+          </div>
+        </div>` : ''}
+        <div style="margin-top: 0.5rem; font-size: 0.7rem; color: #818cf8;">
+          Model: ${escapeHtml(data.aiRiskExplanation.model)} • Advisory only (Hard Rule 6: cannot override policy)
+        </div>
+      </div>
+    </div>` : ''}
 
     ${data.sourceContextExcerpt ? `
     <div class="field">
@@ -218,7 +265,7 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
   // ==========================================================================
   // GET /a/:token — Review Screen / Read-Only Inspection
   // ==========================================================================
-  router.get('/:token', (req: Request, res: Response): void => {
+  router.get('/:token', async (req: Request, res: Response): Promise<void> => {
     try {
       const rawToken = typeof req.params.token === 'string' ? req.params.token : '';
       if (!rawToken) {
@@ -265,6 +312,42 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
         policyReasons = [];
       }
 
+      const explanationResult = explainPolicyDecision(
+        (request.decision as Decision) ?? 'HOLD',
+        policyReasons,
+        {
+          vendorId: request.vendor_id,
+          vendorName,
+          amountMinor: request.amount_minor,
+          currency: request.currency,
+          category: request.category,
+          purpose: request.purpose,
+        }
+      );
+
+      let aiRiskExplanation: AiRiskExplanationResponse | null = null;
+      if (options.aiService) {
+        try {
+          const riskExplainer = new RiskExplainer(options.aiService);
+          aiRiskExplanation = await riskExplainer.explainRisk({
+            requestId: request.id,
+            decision: (request.decision as Decision) ?? 'HOLD',
+            reasons: policyReasons,
+            vendorId: request.vendor_id,
+            vendorName,
+            agentId: request.agent_id,
+            amountMinor: request.amount_minor,
+            currency: request.currency,
+            category: request.category,
+            purpose: request.purpose,
+            sourceContextExcerpt: request.source_context_excerpt,
+          });
+        } catch (err: unknown) {
+          options.logger?.warn?.('[Routes] AI RiskExplainer failed gracefully:', err);
+          aiRiskExplanation = null;
+        }
+      }
+
       const reviewData: ApprovalReviewData = {
         requestId: request.id,
         action: approval.action,
@@ -281,6 +364,8 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
         purpose: request.purpose,
         category: request.category,
         policyReasons,
+        explanations: explanationResult.items,
+        aiRiskExplanation,
         sourceContextExcerpt: request.source_context_excerpt,
         expiresAt: approval.expires_at,
         holdExpiresAt: request.expires_at,

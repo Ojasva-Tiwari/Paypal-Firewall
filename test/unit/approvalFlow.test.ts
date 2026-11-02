@@ -280,6 +280,7 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
           amount: { amountMinor: number; amountDecimal: string; currency: string };
           purpose: string;
           policyReasons: string[];
+          explanations?: Array<{ title: string; description: string; severity: string }>;
           sourceContextExcerpt: string;
         };
       };
@@ -292,6 +293,8 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
       expect(data.review.amount.amountDecimal).toBe('42.50');
       expect(data.review.amount.currency).toBe('USD');
       expect(data.review.policyReasons).toEqual(['AMOUNT_EXCEEDS_AUTO_LIMIT', 'NEW_VENDOR_HOLD']);
+      expect(data.review.explanations).toBeDefined();
+      expect(data.review.explanations?.length).toBe(2);
 
       // Ensure no raw token or sensitive internal data leaked in payload
       const jsonString = JSON.stringify(data);

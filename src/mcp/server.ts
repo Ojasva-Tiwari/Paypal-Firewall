@@ -38,6 +38,9 @@ import { createApprovalRouter } from '../approvals/routes.js';
 import { HoldExpiryWorker } from '../approvals/expiry.js';
 import { ReconcilerWorker } from '../paypal/reconcile.js';
 import { OwnerSessionStore, LoginRateLimiter } from '../auth/owner.js';
+import type { AiService } from '../ai/service.js';
+import { createAiService } from '../ai/index.js';
+import { getConfig, type PayGuardConfig } from '../config/index.js';
 import {
   handleRequestPayment,
   handleGetPaymentStatus,
@@ -180,6 +183,8 @@ export interface McpServerOptions {
   readonly holdExpiryWorkerIntervalMs?: number; // default: 30,000 (30s)
   readonly reconcilerWorkerIntervalMs?: number; // default: 60,000 (60s)
   readonly staticDir?: string;
+  readonly config?: PayGuardConfig;
+  readonly aiService?: AiService;
 }
 
 export interface PayGuardMcpServerInstance {
@@ -195,6 +200,7 @@ export interface PayGuardMcpServerInstance {
   readonly loginRateLimiter: LoginRateLimiter;
   readonly holdExpiryWorker: HoldExpiryWorker;
   readonly reconcilerWorker: ReconcilerWorker;
+  readonly aiService?: AiService;
 }
 
 // ============================================================================
@@ -214,6 +220,33 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       maxRequests: options.maxRequestsPerMinute ?? 30,
       windowMs: options.rateLimitWindowMs ?? 60_000,
     });
+
+  // Resolve AI Service instance:
+  // 1. Explicitly supplied options.aiService always takes precedence (Requirement 2).
+  // 2. Otherwise, automatically initialize via createAiService() based on config (Requirement 1 & 3).
+  let resolvedAiService: AiService | undefined = options.aiService;
+  if (resolvedAiService === undefined) {
+    const config = options.config ?? getConfig();
+    try {
+      resolvedAiService = createAiService({
+        config,
+        repos,
+      });
+    } catch (err: unknown) {
+      // Requirement 3 & 4:
+      // - AI_PROVIDER=gemini with missing/invalid credentials: gracefully disable AI and emit safe warning.
+      // - Never silently substitute mock output when Gemini initialization fails.
+      // - Do not expose API keys, credentials or sensitive configuration in logs.
+      const safeMsg = err instanceof Error ? err.message : String(err);
+      const warnMsg = `[Server] AI service initialization failed for provider '${config.aiProvider}'; AI advisory disabled: ${safeMsg}`;
+      if (options.logger?.warn) {
+        options.logger.warn(warnMsg);
+      } else {
+        console.warn(warnMsg);
+      }
+      resolvedAiService = undefined;
+    }
+  }
 
   // Session Registry: maps sessionId -> ActiveSession
   const sessionRegistry = new Map<string, ActiveSession>();
@@ -257,6 +290,8 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
             ordersService: options.ordersService,
             authorizationsService: options.authorizationsService,
             defaultVaultTokenId: options.defaultVaultTokenId,
+            config: options.config ?? getConfig(),
+            aiService: resolvedAiService,
           });
         case 'get_payment_status':
           return await handleGetPaymentStatus(db, toolArgs, repos);
@@ -375,6 +410,7 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     sessionStore: ownerSessionStore,
     authorizationsService: options.authorizationsService,
     ordersService: options.ordersService,
+    aiService: resolvedAiService,
     logger: options.logger,
   });
   app.use('/api', ownerApiRouter);
@@ -386,6 +422,7 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     sessionStore: ownerSessionStore,
     authorizationsService: options.authorizationsService,
     ordersService: options.ordersService,
+    aiService: resolvedAiService,
     logger: options.logger,
   });
   app.use('/a', approvalRouter);
@@ -607,5 +644,6 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     loginRateLimiter,
     holdExpiryWorker,
     reconcilerWorker,
+    aiService: resolvedAiService,
   };
 }

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { ShieldCheck, History, Eye, Info, AlertTriangle } from 'lucide-react';
+import { useEffect, useState, useCallback } from 'react';
+import { ShieldCheck, History, Eye, AlertTriangle, Sparkles } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -9,7 +9,18 @@ import { LoadingSpinner } from '../components/ui/LoadingState';
 import { EmptyState } from '../components/ui/EmptyState';
 import { apiClient } from '../lib/api';
 import { formatCurrencyFromMinor, formatDateTime } from '../lib/formatters';
-import type { PoliciesResponse, PolicySummary } from '../types/api';
+import { PolicyAuthoringStudio } from '../components/policies/PolicyAuthoringStudio';
+import { PolicyProposalModal } from '../components/policies/PolicyProposalModal';
+import { PolicyProposalsTable, type StatusFilterOption } from '../components/policies/PolicyProposalsTable';
+import type {
+  PoliciesResponse,
+  PolicySummary,
+  PolicyProposalSummary,
+  PolicyProposalDetail,
+  PolicyDraftsResponse,
+  ActivateProposalResponse,
+  RejectProposalResponse,
+} from '../types/api';
 
 interface PolicyRules {
   version?: number;
@@ -34,7 +45,14 @@ export function PoliciesPage() {
   const [error, setError] = useState<string | null>(null);
   const [selectedVersion, setSelectedVersion] = useState<PolicySummary | null>(null);
 
-  const fetchPolicies = async () => {
+  // Proposal State
+  const [proposals, setProposals] = useState<PolicyProposalSummary[]>([]);
+  const [proposalsLoading, setProposalsLoading] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<StatusFilterOption>('ALL');
+  const [activeProposalDetail, setActiveProposalDetail] = useState<PolicyProposalDetail | null>(null);
+  const [isAuthoringVisible, setIsAuthoringVisible] = useState(true);
+
+  const fetchPolicies = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -45,11 +63,55 @@ export function PoliciesPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  const fetchDrafts = useCallback(async (filter: StatusFilterOption = statusFilter) => {
+    try {
+      setProposalsLoading(true);
+      const queryParam = filter !== 'ALL' ? `?status=${filter}` : '';
+      const res = await apiClient.get<PolicyDraftsResponse>(`/api/policies/drafts${queryParam}`);
+      setProposals(res.drafts || []);
+    } catch (err: unknown) {
+      console.error('Failed to load policy proposals:', err);
+    } finally {
+      setProposalsLoading(false);
+    }
+  }, [statusFilter]);
 
   useEffect(() => {
-    fetchPolicies();
-  }, []);
+    void fetchPolicies();
+  }, [fetchPolicies]);
+
+  useEffect(() => {
+    void fetchDrafts(statusFilter);
+  }, [fetchDrafts, statusFilter]);
+
+  const handleProposalDrafted = (proposal: PolicyProposalDetail) => {
+    setActiveProposalDetail(proposal);
+    void fetchDrafts(statusFilter);
+  };
+
+  const handleSelectProposal = async (proposalSummary: PolicyProposalSummary) => {
+    try {
+      const fullDetail = await apiClient.get<PolicyProposalDetail>(`/api/policies/drafts/${proposalSummary.id}`);
+      setActiveProposalDetail(fullDetail);
+    } catch (err: unknown) {
+      console.error('Failed to load proposal details:', err);
+      // Fallback to summary if detail fetch fails
+      setActiveProposalDetail(proposalSummary as PolicyProposalDetail);
+    }
+  };
+
+  const handleProposalActivated = (_res: ActivateProposalResponse) => {
+    setActiveProposalDetail(null);
+    void fetchPolicies();
+    void fetchDrafts(statusFilter);
+  };
+
+  const handleProposalRejected = (_res: RejectProposalResponse) => {
+    setActiveProposalDetail(null);
+    void fetchDrafts(statusFilter);
+  };
 
   if (loading) {
     return (
@@ -67,7 +129,7 @@ export function PoliciesPage() {
           title="Unable to load policies"
           description={error || 'An unexpected error occurred while fetching policies.'}
           action={
-            <Button variant="secondary" size="sm" onClick={fetchPolicies}>
+            <Button variant="secondary" size="sm" onClick={() => void fetchPolicies()}>
               Retry
             </Button>
           }
@@ -83,31 +145,27 @@ export function PoliciesPage() {
   return (
     <div className="space-y-8">
       {/* Page Header */}
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-xl font-bold tracking-tight text-[var(--text-primary)]">Financial Policies</h2>
           <p className="mt-1 text-xs text-[var(--text-secondary)]">
-            Deterministic rules engine ceilings, velocity limits, and immutable version history
+            Deterministic rules engine ceilings, AI authoring, and immutable version history
           </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border-color)] bg-[var(--elevated-bg)] px-3 py-1 font-mono text-xs text-[var(--text-secondary)]">
             <span className="size-1.5 rounded-full bg-[var(--accent-sage)]" />
-            READ-ONLY ENFORCEMENT
+            ENGINE ACTIVE v{active?.version ?? 1}
           </span>
-        </div>
-      </div>
-
-      {/* Scope / Read-only Notice */}
-      <div className="flex items-start gap-3 rounded-2xl border border-[var(--border-color)] bg-[var(--card-bg)] p-4 text-xs text-[var(--text-secondary)]">
-        <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent-sage)]" />
-        <div className="space-y-1">
-          <p className="font-medium text-[var(--text-primary)]">Strict Deterministic Policy Engine</p>
-          <p>
-            All AI agent payment requests are evaluated against the active policy version below. Historical versions
-            are permanently immutable and preserved for audit reconciliation. Policy editing and plain-language authoring
-            are scheduled for upcoming milestones.
-          </p>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setIsAuthoringVisible(!isAuthoringVisible)}
+            className="text-xs"
+          >
+            <Sparkles className="mr-1.5 h-3.5 w-3.5 text-[var(--accent-lavender)]" />
+            {isAuthoringVisible ? 'Hide Authoring Studio' : 'Author New Policy'}
+          </Button>
         </div>
       </div>
 
@@ -251,6 +309,24 @@ export function PoliciesPage() {
         </Card>
       )}
 
+      {/* AI Policy Authoring Studio */}
+      {isAuthoringVisible && (
+        <PolicyAuthoringStudio
+          activeVersion={active?.version ?? 1}
+          onProposalDrafted={handleProposalDrafted}
+        />
+      )}
+
+      {/* Policy Proposals Queue & Management */}
+      <PolicyProposalsTable
+        proposals={proposals}
+        loading={proposalsLoading}
+        statusFilter={statusFilter}
+        onFilterChange={setStatusFilter}
+        onSelectProposal={handleSelectProposal}
+        onRefresh={() => void fetchDrafts(statusFilter)}
+      />
+
       {/* Immutable Version History */}
       <div className="space-y-4">
         <div className="flex items-center gap-2">
@@ -329,7 +405,7 @@ export function PoliciesPage() {
         </Card>
       </div>
 
-      {/* Inspect Policy Version Modal */}
+      {/* Inspect Policy Version Modal (Existing Historical Inspector) */}
       {selectedVersion && (
         <Modal
           isOpen={Boolean(selectedVersion)}
@@ -365,6 +441,18 @@ export function PoliciesPage() {
             </div>
           </div>
         </Modal>
+      )}
+
+      {/* Policy Proposal Review & Action Modal (Phase C) */}
+      {activeProposalDetail && (
+        <PolicyProposalModal
+          isOpen={Boolean(activeProposalDetail)}
+          proposal={activeProposalDetail}
+          activePolicyVersion={active?.version ?? 1}
+          onClose={() => setActiveProposalDetail(null)}
+          onActivated={handleProposalActivated}
+          onRejected={handleProposalRejected}
+        />
       )}
     </div>
   );

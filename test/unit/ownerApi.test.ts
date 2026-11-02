@@ -436,6 +436,12 @@ describe('M4-T5: Owner REST API Unit & Security Integration Tests', () => {
         vendor: { name: string };
         amount: { amountDecimal: string };
         ledger: Array<{ kind: string }>;
+        reasons: string[];
+        explanation?: {
+          decision: string;
+          summary: string;
+          items: Array<{ title: string; description: string; severity: string; recommendedAction: string }>;
+        };
       };
 
       expect(data.id).toBe(seeded.id);
@@ -444,6 +450,12 @@ describe('M4-T5: Owner REST API Unit & Security Integration Tests', () => {
       expect(data.amount.amountDecimal).toBe('40.00');
       expect(data.ledger.length).toBe(1);
       expect(data.ledger[0]?.kind).toBe('RESERVE');
+      expect(data.reasons).toEqual(['OVER_AUTO_LIMIT']);
+      expect(data.explanation).toBeDefined();
+      expect(data.explanation?.decision).toBe('HOLD');
+      expect(data.explanation?.items.length).toBe(1);
+      expect(data.explanation?.items[0]?.title).toBe('Exceeds Auto-Approval Limit');
+      expect(data.explanation?.items[0]?.severity).toBe('HOLD');
     });
 
     it('lazy expiry hook: reading an expired HELD request transitions it to VOIDED', async () => {
