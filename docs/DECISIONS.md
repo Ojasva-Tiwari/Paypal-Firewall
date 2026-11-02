@@ -90,6 +90,42 @@ This document records the foundational decisions made for PayGuard. As spikes ar
 - **Decision**: Adopt `@node-rs/argon2` providing precompiled native Rust N-API binaries for standard Argon2id hashing and verification (`$argon2id$...`), with automatic migration of legacy SHA-256 hashes upon successful authentication.
 - **Consequences**: Zero C++ compilation dependency, high security against GPU/ASIC brute force attacks, seamless hash upgrades.
 
+### D15: Native Fetch for Gemini AI Provider (Zero Added Dependencies)
+- **Date**: 2026-11-01
+- **Context**: Milestone M5 (M5-T1) implements production Gemini API communication. We evaluated using `@google/genai` SDK vs native `fetch`.
+- **Decision**: Use Node.js 20+ native `fetch` with `AbortSignal` for Gemini REST API v1beta communication. Credentials passed strictly via `x-goog-api-key` header.
+- **Consequences**: Zero new dependencies added (Hard Rule 10). Direct control over request timeouts, single transient retry, and response payload validation via existing `zod`. Eliminates SDK version drift.
+
+### D16: Live-Injection LLM Agent Architecture & Pre-Dispatch Validation
+- **Date**: 2026-11-01
+- **Context**: Milestone M5 (M5-T4) demonstrates an autonomous LLM billing agent processing invoices with potential prompt injection against the PayGuard MCP firewall.
+- **Decision**: 
+  1. The LLM interacts exclusively through a structured action loop exposing the 4 canonical MCP tools.
+  2. The local controller enforces pre-dispatch Zod schema validation matching the server's `.strict()` input schemas, a hard 5-step ceiling, and an allowlist of permitted tools.
+  3. Action schemas omit internal chain-of-thought, requiring only a bounded `action_reason` (max 200 chars).
+  4. The local controller independently validates MCP server responses and terminates immediately on `HOLD` or `DENY`, preventing model-generated workarounds.
+  5. Strict provider fallback contract is preserved: missing Gemini credentials fail safely with an explicit diagnostic error rather than silently masquerading synthetic mock data as live Gemini reasoning.
+  6. Remote PayPal Sandbox execution is disabled by default and enabled exclusively via explicit `--execute-sandbox` opt-in.
+  7. Strict credential isolation and sanitization guarantees zero secrets enter prompts, model-visible tool outputs, or logs.
+- **Consequences**: Bounded agentic risk, fail-closed protection against prompt injection, zero unauthorized money moved.
+
+### D17: Prompt-Injection Hardening & Dual-Stage AI Scan Modes
+- **Date**: 2026-11-01
+- **Context**: Milestone M5 (M5-T5) hardens PayGuard against prompt injection in untrusted commercial transaction text (invoice context and payment purpose) without weakening safety or relying on AI for baseline enforcement.
+- **Decision**:
+  1. Implement a two-stage prompt injection detector (`InjectionDetector`):
+     - Stage A: High-confidence deterministic regex heuristics evaluating instruction overrides, system impersonation, payment-control bypasses, credential exfiltration, delimiter manipulation, and zero-width Unicode obfuscation over normalized text. Conclusive matches immediately return `DETECTED` without invoking AI.
+     - Stage B: Structured AI classification (via `AiService`) executed only when heuristics are inconclusive. Output is strictly validated with Zod, and all fields/arrays are bounded.
+  2. Implement an explicit three-outcome contract: `DETECTED`, `CLEAR`, and `INDETERMINATE`. Model timeouts, rate limits, schema mismatches, and provider errors produce `INDETERMINATE`, never `CLEAR`.
+  3. Support three operational scan modes via canonical `AI_SCAN_MODE=off|advisory|enforce`:
+     - `off`: Injection scanning is skipped.
+     - `advisory` (default): Injection detection runs and reports findings in metadata, but never alters deterministic policy evaluation.
+     - `enforce`: High-confidence `DETECTED` injection passes `PROMPT_INJECTION_DETECTED` via `aiFlags` to the policy engine, triggering `AI_FLAG` and escalating `ALLOW` to `HOLD`. Hard `DENY` and existing `HOLD` decisions are strictly preserved.
+  4. Invariant I6 is strictly preserved: AI scanning can only add restrictions, never lower them or upgrade `DENY`/`HOLD` to `ALLOW`.
+  5. Baseline safety never depends on AI: on `INDETERMINATE` results, the deterministic policy baseline stands.
+  6. Scanning runs before database write transactions to avoid holding SQLite locks during external AI provider calls.
+- **Consequences**: Zero new dependencies added (Hard Rule 10). Guaranteed deterministic safety baseline, fail-safe degradation on AI outages, and strict protection against prompt-injection payment tampering.
+
 ---
 
 ## Dependency Justification Log

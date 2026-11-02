@@ -128,3 +128,23 @@ export interface SchemaMigrationRow {
   readonly name: string;
   readonly applied_at: string;
 }
+
+export type ProposalStatus = 'PENDING' | 'ACTIVATED' | 'REJECTED' | 'EXPIRED';
+
+export interface PolicyProposalRow {
+  readonly id: string;
+  readonly base_version: number;
+  readonly rules: string; // JSON PolicyDocument
+  readonly proposal_hash: string;
+  readonly has_relaxations: 0 | 1;
+  readonly relaxations: string; // JSON array of string
+  readonly diff: string; // JSON array of PolicyDiffItem
+  readonly explanation: string;
+  readonly unsupported_requests: string; // JSON array of string
+  readonly owner_id: string;
+  readonly status: ProposalStatus;
+  readonly created_at: string;
+  readonly expires_at: string;
+  readonly activated_at?: string | null;
+  readonly rejected_at?: string | null;
+}

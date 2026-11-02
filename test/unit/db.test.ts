@@ -7,6 +7,7 @@ import {
   runMigrations,
   runInTransaction,
   createRepositories,
+  MIGRATIONS,
   type Database,
 } from '../../src/db/index.js';
 import { toMinorUnits } from '../../src/core/money.js';
@@ -36,7 +37,7 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       const freshDb = createDatabase(':memory:');
       const count = runMigrations(freshDb);
 
-      expect(count).toBe(3);
+      expect(count).toBe(6);
 
       const tables = freshDb
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC")
@@ -55,6 +56,7 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       expect(tableNames).toContain('approvals');
       expect(tableNames).toContain('audit_log');
       expect(tableNames).toContain('ai_runs');
+      expect(tableNames).toContain('policy_proposals');
 
       freshDb.close();
     });
@@ -279,6 +281,149 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
 
       // Audit row is preserved
       expect(repos.auditLog.getLastEntry()?.id).toBe('aud-1');
+    });
+
+    it('should strictly enforce policy_proposals valid transitions, consistent timestamps, immutability, and DELETE prevention at SQLite engine level', () => {
+      const repos = createRepositories(db);
+      const nowIso = new Date().toISOString();
+
+      const proposal = {
+        id: 'prop-trigger-test',
+        base_version: 1,
+        rules: JSON.stringify({ auto_limit_minor: 2000 }),
+        proposal_hash: 'hash-abc-123',
+        has_relaxations: 0 as const,
+        relaxations: '[]',
+        diff: '[]',
+        explanation: 'Test trigger enforcement',
+        unsupported_requests: '[]',
+        owner_id: 'default',
+        status: 'PENDING' as const,
+        created_at: nowIso,
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+        activated_at: null,
+        rejected_at: null,
+      };
+
+      repos.policyProposals.insert(proposal);
+
+      // 1. Core proposal fields must be immutable on UPDATE
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET rules = '{\"tampered\": true}' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET proposal_hash = 'tampered-hash' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET base_version = 2 WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET created_at = '2099-01-01' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET expires_at = '2099-01-01' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // 2. Invalid transitions from PENDING
+      // PENDING -> PENDING is blocked
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET status = 'PENDING' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // PENDING -> arbitrary status is blocked by CHECK constraint or trigger
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET status = 'INVALID_STATUS' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError();
+
+      // 3. Inconsistent timestamps on transition
+      // ACTIVATED requires activated_at and no rejected_at
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET status = 'ACTIVATED' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}', rejected_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // REJECTED requires rejected_at and no activated_at
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET status = 'REJECTED' WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'REJECTED', rejected_at = '${nowIso}', activated_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // EXPIRED requires neither activated_at nor rejected_at
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'EXPIRED', activated_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'EXPIRED', rejected_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // 4. Valid transitions
+      // PENDING -> EXPIRED succeeds with neither timestamp
+      db.prepare("UPDATE policy_proposals SET status = 'EXPIRED' WHERE id = 'prop-trigger-test'").run();
+      expect(repos.policyProposals.getById('prop-trigger-test')?.status).toBe('EXPIRED');
+
+      // 5. Terminal states cannot transition further or mutate timestamps
+      // EXPIRED -> ACTIVATED is blocked
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // Modifying activated_at on EXPIRED is blocked
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET activated_at = '${nowIso}' WHERE id = 'prop-trigger-test'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // Test ACTIVATED terminal immutability with another proposal
+      const propActive = {
+        ...proposal,
+        id: 'prop-trigger-active',
+      };
+      repos.policyProposals.insert(propActive);
+
+      // PENDING -> ACTIVATED succeeds with activated_at and no rejected_at
+      db.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}' WHERE id = 'prop-trigger-active'`).run();
+      expect(repos.policyProposals.getById('prop-trigger-active')?.status).toBe('ACTIVATED');
+
+      // ACTIVATED -> REJECTED is blocked
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'REJECTED', rejected_at = '${nowIso}' WHERE id = 'prop-trigger-active'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // Modifying activated_at timestamp after transition is blocked
+      expect(() => {
+        db.prepare("UPDATE policy_proposals SET activated_at = '2099-01-01' WHERE id = 'prop-trigger-active'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // Test REJECTED terminal immutability with third proposal
+      const propRej = {
+        ...proposal,
+        id: 'prop-trigger-rej',
+      };
+      repos.policyProposals.insert(propRej);
+
+      // PENDING -> REJECTED succeeds with rejected_at and no activated_at
+      db.prepare(`UPDATE policy_proposals SET status = 'REJECTED', rejected_at = '${nowIso}' WHERE id = 'prop-trigger-rej'`).run();
+      expect(repos.policyProposals.getById('prop-trigger-rej')?.status).toBe('REJECTED');
+
+      // REJECTED -> ACTIVATED is blocked
+      expect(() => {
+        db.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}' WHERE id = 'prop-trigger-rej'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // 6. DELETE prevention trigger
+      expect(() => {
+        db.prepare("DELETE FROM policy_proposals WHERE id = 'prop-trigger-test'").run();
+      }).toThrowError(/policy_proposals is append-only: DELETE operations are strictly prohibited/);
     });
   });
 
@@ -569,6 +714,213 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       expect(reloaded?.daily_budget_minor).toBe(7500);
 
       diskDb2.close();
+    });
+  });
+
+  describe('Migration 6 Upgrade Compatibility & Trigger Hardening', () => {
+    it('should produce identical trigger definitions on fresh database (1-6) vs upgraded database (1-5 then 6)', () => {
+      // Path A: Fresh database running all migrations 1..6
+      const freshDb = createDatabase(':memory:');
+      const freshCount = runMigrations(freshDb);
+      expect(freshCount).toBe(6);
+
+      // Path B: Existing database running migrations 1..5 first, then upgrading to 6
+      const upgradedDb = createDatabase(':memory:');
+      upgradedDb.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 5)) {
+        upgradedDb.transaction(() => {
+          upgradedDb.exec(migration.up);
+          upgradedDb.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Verify upgradedDb is at version 5
+      const appliedBefore = upgradedDb.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5]);
+
+      // Run runMigrations on upgradedDb to apply Migration 6
+      const upgradeCount = runMigrations(upgradedDb);
+      expect(upgradeCount).toBe(1);
+
+      const appliedAfter = upgradedDb.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6]);
+
+      // Compare trigger definitions between freshDb and upgradedDb
+      const getTriggers = (database: typeof freshDb) =>
+        database.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'policy_proposals' ORDER BY name ASC").all();
+
+      const freshTriggers = getTriggers(freshDb);
+      const upgradedTriggers = getTriggers(upgradedDb);
+
+      expect(freshTriggers.length).toBe(2);
+      expect(upgradedTriggers.length).toBe(2);
+      expect(upgradedTriggers).toEqual(freshTriggers);
+
+      freshDb.close();
+      upgradedDb.close();
+    });
+
+    it('should preserve existing policy_proposals and audit_log records across Migration 6 upgrade', () => {
+      const dbAtV5 = createDatabase(':memory:');
+      dbAtV5.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 5)) {
+        dbAtV5.transaction(() => {
+          dbAtV5.exec(migration.up);
+          dbAtV5.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      const nowIso = new Date().toISOString();
+      const testProposal = {
+        id: 'prop-pre-migration-6',
+        base_version: 1,
+        rules: JSON.stringify({ auto_limit_minor: 5000 }),
+        proposal_hash: 'hash-pre-6',
+        has_relaxations: 1,
+        relaxations: JSON.stringify(['Auto limit increased']),
+        diff: JSON.stringify([{ field: 'auto_limit_minor', change: 'RELAXED' }]),
+        explanation: 'Pre-upgrade proposal',
+        unsupported_requests: '[]',
+        owner_id: 'default',
+        status: 'PENDING',
+        created_at: nowIso,
+        expires_at: new Date(Date.now() + 600000).toISOString(),
+        activated_at: null,
+        rejected_at: null,
+      };
+
+      // Insert pre-existing proposal record into v5 database
+      dbAtV5.prepare(`
+        INSERT INTO policy_proposals (
+          id, base_version, rules, proposal_hash, has_relaxations,
+          relaxations, diff, explanation, unsupported_requests,
+          owner_id, status, created_at, expires_at, activated_at, rejected_at
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?
+        )
+      `).run(
+        testProposal.id,
+        testProposal.base_version,
+        testProposal.rules,
+        testProposal.proposal_hash,
+        testProposal.has_relaxations,
+        testProposal.relaxations,
+        testProposal.diff,
+        testProposal.explanation,
+        testProposal.unsupported_requests,
+        testProposal.owner_id,
+        testProposal.status,
+        testProposal.created_at,
+        testProposal.expires_at,
+        testProposal.activated_at,
+        testProposal.rejected_at
+      );
+
+      // Insert pre-existing audit_log record into v5 database
+      dbAtV5.prepare(`
+        INSERT INTO audit_log (id, ts, actor, event, request_id, payload, prev_hash, hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('aud-pre-6', nowIso, 'owner', 'POLICY_PROPOSAL_CREATED', null, '{}', null, 'hash-aud-1');
+
+      // Now run migration runner to upgrade from 5 to 6
+      const appliedCount = runMigrations(dbAtV5);
+      expect(appliedCount).toBe(1);
+
+      // Verify proposal survived untouched
+      interface ProposalRow {
+        id: string;
+        base_version: number;
+        rules: string;
+        proposal_hash: string;
+        has_relaxations: number;
+        status: string;
+        activated_at: string | null;
+      }
+      const survivedProposal = dbAtV5.prepare('SELECT * FROM policy_proposals WHERE id = ?').get('prop-pre-migration-6') as ProposalRow | undefined;
+      expect(survivedProposal).toBeDefined();
+      expect(survivedProposal?.id).toBe(testProposal.id);
+      expect(survivedProposal?.base_version).toBe(testProposal.base_version);
+      expect(survivedProposal?.rules).toBe(testProposal.rules);
+      expect(survivedProposal?.proposal_hash).toBe(testProposal.proposal_hash);
+      expect(survivedProposal?.has_relaxations).toBe(testProposal.has_relaxations);
+      expect(survivedProposal?.status).toBe('PENDING');
+
+      // Verify audit_log survived untouched
+      interface AuditRow {
+        id: string;
+        actor: string;
+        event: string;
+        hash: string;
+      }
+      const survivedAudit = dbAtV5.prepare('SELECT * FROM audit_log WHERE id = ?').get('aud-pre-6') as AuditRow | undefined;
+      expect(survivedAudit).toBeDefined();
+      expect(survivedAudit?.id).toBe('aud-pre-6');
+      expect(survivedAudit?.actor).toBe('owner');
+      expect(survivedAudit?.event).toBe('POLICY_PROPOSAL_CREATED');
+      expect(survivedAudit?.hash).toBe('hash-aud-1');
+
+      // Verify the upgraded database rejects invalid transitions and timestamp combinations
+      expect(() => {
+        dbAtV5.prepare("UPDATE policy_proposals SET status = 'ACTIVATED' WHERE id = 'prop-pre-migration-6'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        dbAtV5.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}', rejected_at = '${nowIso}' WHERE id = 'prop-pre-migration-6'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        dbAtV5.prepare("UPDATE policy_proposals SET status = 'REJECTED' WHERE id = 'prop-pre-migration-6'").run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        dbAtV5.prepare(`UPDATE policy_proposals SET status = 'EXPIRED', activated_at = '${nowIso}' WHERE id = 'prop-pre-migration-6'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      expect(() => {
+        dbAtV5.prepare("DELETE FROM policy_proposals WHERE id = 'prop-pre-migration-6'").run();
+      }).toThrowError(/policy_proposals is append-only: DELETE operations are strictly prohibited/);
+
+      // Verify valid transition works on the survived record
+      dbAtV5.prepare(`UPDATE policy_proposals SET status = 'ACTIVATED', activated_at = '${nowIso}' WHERE id = 'prop-pre-migration-6'`).run();
+      const activated = dbAtV5.prepare('SELECT status, activated_at FROM policy_proposals WHERE id = ?').get('prop-pre-migration-6') as { status: string; activated_at: string | null } | undefined;
+      expect(activated?.status).toBe('ACTIVATED');
+      expect(activated?.activated_at).toBe(nowIso);
+
+      // Verify terminal record cannot transition further
+      expect(() => {
+        dbAtV5.prepare(`UPDATE policy_proposals SET status = 'REJECTED', rejected_at = '${nowIso}' WHERE id = 'prop-pre-migration-6'`).run();
+      }).toThrowError(/policy_proposals is tamper-proof/);
+
+      // Verify Migration 6 is not reapplied on subsequent runMigrations calls
+      const rerun1 = runMigrations(dbAtV5);
+      expect(rerun1).toBe(0);
+      const rerun2 = runMigrations(dbAtV5);
+      expect(rerun2).toBe(0);
+
+      const v6Count = dbAtV5.prepare('SELECT COUNT(*) as count FROM schema_migrations WHERE version = 6').get() as { count: number };
+      expect(v6Count.count).toBe(1);
+
+      dbAtV5.close();
     });
   });
 });

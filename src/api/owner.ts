@@ -51,10 +51,17 @@ import {
 import { executeDecision } from '../core/executeDecision.js';
 import { expirePaymentHold } from '../approvals/expiry.js';
 import { getRollingBudgets } from '../core/facts.js';
-import { PolicyDocumentSchema } from '../policy/types.js';
+import { PolicyDocumentSchema, type Decision } from '../policy/types.js';
+import {
+  explainPolicyDecision,
+  type PolicyExplanationContext,
+} from '../policy/explanations.js';
 import { generateAgentKey } from '../mcp/auth.js';
 import { AuthorizationError } from '../paypal/authorizations.js';
-import type { AgentRow, VendorRow, PolicyVersionRow } from '../db/types.js';
+import type { AgentRow, VendorRow, PolicyVersionRow, PolicyProposalRow, ProposalStatus } from '../db/types.js';
+import type { AiService } from '../ai/service.js';
+import { RiskExplainer, type AiRiskExplanationResponse } from '../ai/riskExplainer.js';
+import { PolicyDrafter, PolicyDrafterError, computeProposalHash } from '../ai/policyDrafter.js';
 
 // ============================================================================
 // Types & Options
@@ -66,6 +73,7 @@ export interface OwnerApiRouterOptions {
   readonly sessionStore: OwnerSessionStore;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly ordersService?: PayPalOrdersService;
+  readonly aiService?: AiService;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -100,7 +108,7 @@ const ALLOWED_ACTORS: ReadonlySet<string> = new Set<string>([
 
 export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
   const router = Router();
-  const { db, repos, sessionStore, authorizationsService, ordersService, logger } = options;
+  const { db, repos, sessionStore, authorizationsService, ordersService, aiService, logger } = options;
 
   // --------------------------------------------------------------------------
   // Public Health Endpoint (/api/healthz)
@@ -353,6 +361,85 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         createdAt: ap.created_at,
       }));
 
+      // Build deterministic policy explanation context (M5-T2)
+      let autoLimitMinor: number | undefined;
+      let hardCapMinor: number | undefined;
+      let globalBudgetMinor: number | undefined;
+      let newVendorAction: 'HOLD' | 'DENY' | undefined;
+      let allowedCurrencies: string[] | undefined;
+      let vendorCategories: string[] | undefined;
+
+      if (vendor) {
+        try {
+          if (vendor.categories) vendorCategories = JSON.parse(vendor.categories) as string[];
+        } catch {
+          // ignore
+        }
+      }
+
+      try {
+        const activePolicy = repos.policyVersions.getActive();
+        if (activePolicy?.rules) {
+          const rules = JSON.parse(activePolicy.rules) as Record<string, unknown>;
+          if (typeof rules.auto_approve_threshold_minor === 'number') autoLimitMinor = rules.auto_approve_threshold_minor;
+          if (typeof rules.hard_cap_minor === 'number') hardCapMinor = rules.hard_cap_minor;
+          if (typeof rules.daily_budget_minor === 'number') globalBudgetMinor = rules.daily_budget_minor;
+          if (rules.new_vendor_action === 'HOLD' || rules.new_vendor_action === 'DENY') {
+            newVendorAction = rules.new_vendor_action;
+          }
+          if (Array.isArray(rules.allowed_currencies)) allowedCurrencies = rules.allowed_currencies as string[];
+        }
+      } catch {
+        // Safe degradation: explanation engine handles missing context gracefully
+      }
+
+      const explanationContext: PolicyExplanationContext = {
+        agentId: request.agent_id,
+        agentName: agent?.name,
+        vendorId: request.vendor_id,
+        vendorName: vendor?.name,
+        amountMinor: request.amount_minor,
+        currency: request.currency,
+        category: request.category,
+        purpose: request.purpose,
+        autoLimitMinor,
+        hardCapMinor,
+        globalBudgetMinor,
+        newVendorAction,
+        allowedCurrencies,
+        vendorCategories,
+      };
+
+      const explanation = explainPolicyDecision(
+        (request.decision as Decision) ?? 'HOLD',
+        reasons,
+        explanationContext
+      );
+
+      let aiRiskExplanation: AiRiskExplanationResponse | null = null;
+      if (options.aiService) {
+        try {
+          const riskExplainer = new RiskExplainer(options.aiService);
+          aiRiskExplanation = await riskExplainer.explainRisk({
+            requestId: request.id,
+            decision: (request.decision as Decision) ?? 'HOLD',
+            reasons,
+            vendorId: request.vendor_id,
+            vendorName: vendor?.name,
+            agentId: request.agent_id,
+            agentName: agent?.name,
+            amountMinor: request.amount_minor,
+            currency: request.currency,
+            category: request.category,
+            purpose: request.purpose,
+            sourceContextExcerpt: request.source_context_excerpt,
+          });
+        } catch (err: unknown) {
+          logger?.warn?.('[OwnerApi] AI RiskExplainer failed gracefully:', err);
+          aiRiskExplanation = null;
+        }
+      }
+
       res.status(200).json({
         id: request.id,
         agent: {
@@ -374,6 +461,8 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         status: request.status,
         decision: request.decision,
         reasons,
+        explanation,
+        aiRiskExplanation,
         policyVersionId: request.policy_version_id,
         paypalOrderId: request.paypal_order_id,
         paypalAuthorizationId: request.paypal_authorization_id,
@@ -747,11 +836,389 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
     }
   });
 
-  router.post('/policies', (req: Request, res: Response): void => {
+  // ==========================================================================
+  // Helper: Proposal Activation Handler
+  // ==========================================================================
+  const handleProposalActivation = async (
+    req: Request,
+    res: Response,
+    explicitProposalId?: string
+  ): Promise<void> => {
+    try {
+      const rawBody = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+      const proposalId = explicitProposalId ?? (typeof rawBody.proposalId === 'string' ? rawBody.proposalId.trim() : '');
+      const clientProposalHash = typeof rawBody.proposalHash === 'string' ? rawBody.proposalHash.trim() : undefined;
+      const acknowledgeRelaxations = rawBody.acknowledgeRelaxations === true;
+
+      if (!proposalId) {
+        res.status(400).json({ error: 'INVALID_PROPOSAL_ID', message: 'Proposal ID is required' });
+        return;
+      }
+
+      // Step 1: Pre-fetch proposal
+      const proposal = repos.policyProposals.getById(proposalId);
+      if (!proposal) {
+        res.status(404).json({ error: 'PROPOSAL_NOT_FOUND', message: 'Policy proposal not found' });
+        return;
+      }
+
+      // Step 2: Ownership verification (Safeguard 1)
+      const currentOwnerId = req.ownerSession?.ownerId || 'default';
+      if (proposal.owner_id !== currentOwnerId) {
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Proposal belongs to another owner or session' });
+        return;
+      }
+
+      // Step 3: Status checks
+      if (proposal.status === 'ACTIVATED') {
+        res.status(409).json({ error: 'ALREADY_ACTIVATED', message: 'Proposal has already been activated' });
+        return;
+      }
+      if (proposal.status === 'REJECTED') {
+        res.status(409).json({ error: 'ALREADY_REJECTED', message: 'Proposal has been rejected' });
+        return;
+      }
+
+      // Step 4: Lazy Expiry Check
+      const nowIso = new Date().toISOString();
+      const isExpired = proposal.status === 'EXPIRED' || new Date(proposal.expires_at).getTime() <= Date.now();
+      if (isExpired) {
+        if (proposal.status !== 'EXPIRED') {
+          runInTransaction(db, () => {
+            repos.policyProposals.updateStatus(proposal.id, 'EXPIRED', nowIso);
+            writeAuditLogEntry(db, repos, {
+              actor: 'system',
+              event: 'POLICY_PROPOSAL_EXPIRED',
+              timestamp: nowIso,
+              payload: {
+                proposal_id: proposal.id,
+                base_version: proposal.base_version,
+              },
+            });
+          });
+        }
+        res.status(410).json({ error: 'PROPOSAL_EXPIRED', message: 'Policy proposal has expired and cannot be activated' });
+        return;
+      }
+
+      // Step 5: Hash verification (Safeguards 4 & 5)
+      // If client provided proposalHash, it MUST match the proposal's stored hash
+      if (clientProposalHash && clientProposalHash !== proposal.proposal_hash) {
+        res.status(400).json({
+          error: 'PROPOSAL_HASH_MISMATCH',
+          message: 'Client provided proposal hash does not match stored proposal hash',
+        });
+        return;
+      }
+
+      // Recompute hash from stored rules to verify DB record has not been tampered with
+      let rawParsedRules: unknown;
+      try {
+        rawParsedRules = JSON.parse(proposal.rules);
+      } catch {
+        res.status(400).json({ error: 'CORRUPTED_RULES', message: 'Stored proposal rules are malformed JSON' });
+        return;
+      }
+
+      const rulesParse = PolicyDocumentSchema.safeParse({
+        ...(rawParsedRules as Record<string, unknown>),
+        version: proposal.base_version,
+      });
+      if (!rulesParse.success) {
+        res.status(400).json({
+          error: 'RULE_CONSTRAINT_VIOLATION',
+          message: 'Stored proposal rules failed schema validation',
+          details: rulesParse.error.format(),
+        });
+        return;
+      }
+
+      const { version: _storedV, ...validatedStoredRules } = rulesParse.data;
+      const recomputedHash = computeProposalHash(proposal.base_version, validatedStoredRules);
+      if (recomputedHash !== proposal.proposal_hash) {
+        res.status(400).json({
+          error: 'PROPOSAL_HASH_TAMPERED',
+          message: 'Stored proposal hash does not match recomputed rules hash',
+        });
+        return;
+      }
+
+      // Step 6: Relaxation acknowledgement check (Safeguard 6)
+      if (proposal.has_relaxations === 1 && !acknowledgeRelaxations) {
+        let relaxationsList: unknown[] = [];
+        try {
+          relaxationsList = JSON.parse(proposal.relaxations);
+        } catch {
+          relaxationsList = [];
+        }
+        res.status(400).json({
+          error: 'RELAXATION_ACKNOWLEDGEMENT_REQUIRED',
+          message: 'This policy proposal contains relaxations that must be explicitly acknowledged',
+          relaxations: relaxationsList,
+        });
+        return;
+      }
+
+      // Step 7: Atomic SQLite Transaction (Safeguard 7)
+      let claimResult: {
+        success: boolean;
+        statusCode?: number;
+        error?: string;
+        message?: string;
+        details?: unknown;
+        policy?: {
+          id: string;
+          version: number;
+          rules: unknown;
+          author: string;
+          active: boolean;
+          createdAt: string;
+        };
+      };
+
+      try {
+        claimResult = runInTransaction(db, () => {
+          // A. Concurrency Check: re-check active policy version
+          const currentActive = repos.policyVersions.getActive();
+          if (!currentActive || currentActive.version !== proposal.base_version) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: 'CONCURRENCY_CONFLICT',
+              message: `Active policy version (${currentActive?.version ?? 'none'}) does not match proposal base version (${proposal.base_version})`,
+            };
+          }
+
+          // B. Next version number
+          const nextVersion = repos.policyVersions.getNextVersion();
+
+          // C. Validate canonical schema for candidate doc
+          const candidateDoc = {
+            ...validatedStoredRules,
+            version: nextVersion,
+          };
+          const parseResult = PolicyDocumentSchema.safeParse(candidateDoc);
+          if (!parseResult.success) {
+            return {
+              success: false,
+              statusCode: 400,
+              error: 'RULE_CONSTRAINT_VIOLATION',
+              message: 'Policy document validation failed',
+              details: parseResult.error.format(),
+            };
+          }
+
+          // D. Transition proposal status to ACTIVATED
+          const transitioned = repos.policyProposals.updateStatus(proposal.id, 'ACTIVATED', nowIso);
+          if (!transitioned) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: 'ALREADY_ACTIVATED',
+              message: 'Proposal status could not be transitioned to ACTIVATED (already processed)',
+            };
+          }
+
+          // E. Insert new immutable policy version
+          const newPolicyId = `pol-${crypto.randomUUID()}`;
+          const newPolicyRow: PolicyVersionRow = {
+            id: newPolicyId,
+            version: nextVersion,
+            rules: JSON.stringify(parseResult.data),
+            author: 'ai_draft_confirmed',
+            active: 0,
+            created_at: nowIso,
+          };
+          repos.policyVersions.insert(newPolicyRow);
+
+          // F. Set active
+          repos.policyVersions.setActive(newPolicyId);
+
+          // G. Write audit log entry in the same transaction
+          writeAuditLogEntry(db, repos, {
+            actor: 'owner',
+            event: 'POLICY_ACTIVATED',
+            timestamp: nowIso,
+            payload: {
+              proposal_id: proposal.id,
+              policy_version_id: newPolicyId,
+              version: nextVersion,
+              base_version: proposal.base_version,
+              author: 'ai_draft_confirmed',
+              has_relaxations: proposal.has_relaxations === 1,
+              proposal_hash: proposal.proposal_hash,
+            },
+          });
+
+          return {
+            success: true,
+            policy: {
+              id: newPolicyId,
+              version: nextVersion,
+              rules: parseResult.data,
+              author: 'ai_draft_confirmed',
+              active: true,
+              createdAt: nowIso,
+            },
+          };
+        });
+      } catch (txErr: unknown) {
+        logger?.error?.('[OwnerApi] Transaction error during policy activation:', txErr);
+        res.status(500).json({ error: 'TRANSACTION_FAILED', message: 'Failed to atomically activate policy' });
+        return;
+      }
+
+      if (!claimResult.success || !claimResult.policy) {
+        res.status(claimResult.statusCode ?? 400).json({
+          error: claimResult.error,
+          message: claimResult.message,
+          details: claimResult.details,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        id: claimResult.policy.id,
+        version: claimResult.policy.version,
+        rules: claimResult.policy.rules,
+        author: claimResult.policy.author,
+        active: claimResult.policy.active,
+        createdAt: claimResult.policy.createdAt,
+        proposalId: proposal.id,
+        policy: claimResult.policy,
+      });
+    } catch (err: unknown) {
+      logger?.error?.('[OwnerApi] Error in handleProposalActivation:', err);
+      res.status(500).json({ error: 'Failed to activate policy proposal' });
+    }
+  };
+
+  // ==========================================================================
+  // Helper: Proposal Rejection Handler
+  // ==========================================================================
+  const handleProposalRejection = async (
+    req: Request,
+    res: Response,
+    explicitProposalId?: string
+  ): Promise<void> => {
+    try {
+      const rawBody = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+      const proposalId = explicitProposalId ?? (typeof rawBody.proposalId === 'string' ? rawBody.proposalId.trim() : '');
+      const reason = typeof rawBody.reason === 'string' && rawBody.reason.trim() ? rawBody.reason.trim() : 'Rejected by owner';
+
+      if (!proposalId) {
+        res.status(400).json({ error: 'INVALID_PROPOSAL_ID', message: 'Proposal ID is required' });
+        return;
+      }
+
+      const proposal = repos.policyProposals.getById(proposalId);
+      if (!proposal) {
+        res.status(404).json({ error: 'PROPOSAL_NOT_FOUND', message: 'Policy proposal not found' });
+        return;
+      }
+
+      // Ownership verification
+      const currentOwnerId = req.ownerSession?.ownerId || 'default';
+      if (proposal.owner_id !== currentOwnerId) {
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Proposal belongs to another owner or session' });
+        return;
+      }
+
+      if (proposal.status === 'ACTIVATED') {
+        res.status(409).json({ error: 'ALREADY_ACTIVATED', message: 'Proposal has already been activated' });
+        return;
+      }
+      if (proposal.status === 'REJECTED') {
+        res.status(409).json({ error: 'ALREADY_REJECTED', message: 'Proposal has been rejected' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const isExpired = proposal.status === 'EXPIRED' || new Date(proposal.expires_at).getTime() <= Date.now();
+      if (isExpired) {
+        if (proposal.status !== 'EXPIRED') {
+          runInTransaction(db, () => {
+            repos.policyProposals.updateStatus(proposal.id, 'EXPIRED', nowIso);
+            writeAuditLogEntry(db, repos, {
+              actor: 'system',
+              event: 'POLICY_PROPOSAL_EXPIRED',
+              timestamp: nowIso,
+              payload: {
+                proposal_id: proposal.id,
+                base_version: proposal.base_version,
+              },
+            });
+          });
+        }
+        res.status(410).json({ error: 'PROPOSAL_EXPIRED', message: 'Policy proposal has expired and cannot be rejected' });
+        return;
+      }
+
+      let rejectionResult: { success: boolean; statusCode?: number; error?: string; message?: string };
+      try {
+        rejectionResult = runInTransaction(db, () => {
+          const transitioned = repos.policyProposals.updateStatus(proposal.id, 'REJECTED', nowIso);
+          if (!transitioned) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: 'ALREADY_REJECTED',
+              message: 'Proposal could not be transitioned to REJECTED',
+            };
+          }
+
+          writeAuditLogEntry(db, repos, {
+            actor: 'owner',
+            event: 'POLICY_PROPOSAL_REJECTED',
+            timestamp: nowIso,
+            payload: {
+              proposal_id: proposal.id,
+              base_version: proposal.base_version,
+              reason,
+            },
+          });
+
+          return { success: true };
+        });
+      } catch (txErr: unknown) {
+        logger?.error?.('[OwnerApi] Transaction error during policy proposal rejection:', txErr);
+        res.status(500).json({ error: 'TRANSACTION_FAILED', message: 'Failed to atomically reject policy proposal' });
+        return;
+      }
+
+      if (!rejectionResult.success) {
+        res.status(rejectionResult.statusCode ?? 400).json({
+          error: rejectionResult.error,
+          message: rejectionResult.message,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        proposalId: proposal.id,
+        status: 'REJECTED',
+        reason,
+      });
+    } catch (err: unknown) {
+      logger?.error?.('[OwnerApi] Error in handleProposalRejection:', err);
+      res.status(500).json({ error: 'Failed to reject policy proposal' });
+    }
+  };
+
+  // POST /policies — Direct creation or proposal activation
+  router.post('/policies', async (req: Request, res: Response): Promise<void> => {
     try {
       const rawBody = req.body as Record<string, unknown>;
       if (!rawBody || typeof rawBody !== 'object') {
         res.status(400).json({ error: 'Invalid policy payload: object expected' });
+        return;
+      }
+
+      // If proposalId is provided, delegate to proposal activation
+      if (typeof rawBody.proposalId === 'string' && rawBody.proposalId.trim()) {
+        await handleProposalActivation(req, res);
         return;
       }
 
@@ -823,6 +1290,297 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
       res.status(500).json({ error: 'Failed to create and activate policy version' });
     }
   });
+
+  // POST /policies/draft — Draft policy proposal via AI PolicyDrafter
+  router.post('/policies/draft', async (req: Request, res: Response): Promise<void> => {
+    try {
+      const rawBody = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+      const prompt = typeof rawBody.prompt === 'string' ? rawBody.prompt.trim() : '';
+      const rawTtl = typeof rawBody.ttlMinutes === 'number' ? rawBody.ttlMinutes : undefined;
+      const ttlMinutes = rawTtl && Number.isInteger(rawTtl) && rawTtl > 0 ? Math.min(rawTtl, 1440) : 60;
+
+      if (!prompt) {
+        res.status(400).json({
+          error: 'INVALID_PROMPT',
+          message: 'Policy authoring prompt must be a non-empty string',
+        });
+        return;
+      }
+
+      if (prompt.length > 2000) {
+        res.status(400).json({
+          error: 'INVALID_PROMPT',
+          message: 'Policy authoring prompt exceeds maximum allowed length of 2000 characters',
+        });
+        return;
+      }
+
+      if (!aiService) {
+        res.status(503).json({
+          error: 'AI_SERVICE_UNAVAILABLE',
+          message: 'AI service is not configured or available',
+        });
+        return;
+      }
+
+      const activePolicy = repos.policyVersions.getActive();
+      if (!activePolicy) {
+        res.status(500).json({
+          error: 'NO_ACTIVE_POLICY',
+          message: 'No active policy found in repository',
+        });
+        return;
+      }
+
+      let parsedActive: unknown;
+      try {
+        parsedActive = JSON.parse(activePolicy.rules);
+      } catch {
+        res.status(500).json({
+          error: 'MALFORMED_ACTIVE_POLICY',
+          message: 'Current active policy rules are malformed JSON',
+        });
+        return;
+      }
+
+      const activeParse = PolicyDocumentSchema.safeParse({
+        ...(parsedActive as Record<string, unknown>),
+        version: activePolicy.version,
+      });
+      if (!activeParse.success) {
+        res.status(500).json({
+          error: 'MALFORMED_ACTIVE_POLICY',
+          message: 'Active policy rules failed schema validation',
+          details: activeParse.error.format(),
+        });
+        return;
+      }
+
+      const { version: _actV, ...activeClean } = activeParse.data;
+
+      const drafter = new PolicyDrafter(aiService);
+
+      let draftResult;
+      try {
+        draftResult = await drafter.draftPolicy({
+          prompt,
+          activePolicy: activeClean,
+          baseVersion: activePolicy.version,
+        });
+      } catch (drafterErr: unknown) {
+        if (drafterErr instanceof PolicyDrafterError) {
+          const status =
+            drafterErr.code === 'INJECTION_DETECTED'
+              ? 400
+              : drafterErr.code === 'INJECTION_SCAN_INDETERMINATE'
+              ? 422
+              : drafterErr.code === 'AI_SERVICE_RATE_LIMITED'
+              ? 429
+              : drafterErr.code === 'AI_SERVICE_TIMEOUT'
+              ? 504
+              : drafterErr.code === 'AI_SERVICE_UNAVAILABLE'
+              ? 502
+              : 400;
+
+          res.status(status).json({
+            error: drafterErr.code,
+            message: drafterErr.message,
+            details: drafterErr.details,
+          });
+          return;
+        }
+        throw drafterErr;
+      }
+
+      const proposalId = `prop-${crypto.randomUUID()}`;
+      const nowIso = new Date().toISOString();
+      const expiresAtIso = new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString();
+      const ownerId = req.ownerSession?.ownerId || 'default';
+
+      const proposalRow: PolicyProposalRow = {
+        id: proposalId,
+        base_version: draftResult.baseVersion,
+        rules: JSON.stringify(draftResult.proposedRules),
+        proposal_hash: draftResult.proposalHash,
+        has_relaxations: draftResult.hasRelaxations ? 1 : 0,
+        relaxations: JSON.stringify(draftResult.relaxations),
+        diff: JSON.stringify(draftResult.diff),
+        explanation: draftResult.explanation,
+        unsupported_requests: JSON.stringify(draftResult.unsupportedRequests),
+        owner_id: ownerId,
+        status: 'PENDING',
+        created_at: nowIso,
+        expires_at: expiresAtIso,
+        activated_at: null,
+        rejected_at: null,
+      };
+
+      runInTransaction(db, () => {
+        repos.policyProposals.insert(proposalRow);
+        writeAuditLogEntry(db, repos, {
+          actor: 'owner',
+          event: 'POLICY_PROPOSAL_GENERATED',
+          timestamp: nowIso,
+          payload: {
+            proposal_id: proposalId,
+            base_version: draftResult.baseVersion,
+            proposal_hash: draftResult.proposalHash,
+            has_relaxations: draftResult.hasRelaxations,
+            model: draftResult.metadata.model,
+            prompt,
+          },
+        });
+      });
+
+      res.status(201).json({
+        id: proposalId,
+        baseVersion: draftResult.baseVersion,
+        rules: draftResult.proposedRules,
+        proposalHash: draftResult.proposalHash,
+        hasRelaxations: draftResult.hasRelaxations,
+        relaxations: draftResult.relaxations,
+        diff: draftResult.diff,
+        explanation: draftResult.explanation,
+        unsupportedRequests: draftResult.unsupportedRequests,
+        status: 'PENDING',
+        createdAt: nowIso,
+        expiresAt: expiresAtIso,
+        metadata: draftResult.metadata,
+      });
+    } catch (err: unknown) {
+      logger?.error?.('[OwnerApi] Error in POST /policies/draft:', err);
+      res.status(500).json({ error: 'Failed to draft policy proposal' });
+    }
+  });
+
+  // GET /policies/drafts — List policy proposals
+  router.get('/policies/drafts', (req: Request, res: Response): void => {
+    try {
+      const statusParam = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : undefined;
+      const validStatus = statusParam && ['PENDING', 'ACTIVATED', 'REJECTED', 'EXPIRED'].includes(statusParam)
+        ? (statusParam as ProposalStatus)
+        : undefined;
+
+      const rawLimit = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 50;
+      const limit = Number.isInteger(rawLimit) ? Math.min(Math.max(1, rawLimit), 100) : 50;
+
+      // Owner isolation: strictly filter proposals by authenticated owner session
+      const ownerId = req.ownerSession?.ownerId || 'default';
+      const proposals = repos.policyProposals.list({ ownerId, status: validStatus, limit });
+
+      const mapped = proposals.map((p) => {
+        let rules: unknown = {};
+        let diff: unknown = [];
+        let relaxations: unknown = [];
+        let unsupportedRequests: unknown = [];
+        try { rules = JSON.parse(p.rules); } catch { rules = { raw: p.rules }; }
+        try { diff = JSON.parse(p.diff); } catch { diff = []; }
+        try { relaxations = JSON.parse(p.relaxations); } catch { relaxations = []; }
+        try { unsupportedRequests = JSON.parse(p.unsupported_requests); } catch { unsupportedRequests = []; }
+
+        return {
+          id: p.id,
+          baseVersion: p.base_version,
+          rules,
+          proposalHash: p.proposal_hash,
+          hasRelaxations: p.has_relaxations === 1,
+          relaxations,
+          diff,
+          explanation: p.explanation,
+          unsupportedRequests,
+          ownerId: p.owner_id,
+          status: p.status,
+          createdAt: p.created_at,
+          expiresAt: p.expires_at,
+          activatedAt: p.activated_at,
+          rejectedAt: p.rejected_at,
+        };
+      });
+
+      res.status(200).json({ drafts: mapped, total: mapped.length });
+    } catch (err: unknown) {
+      logger?.error?.('[OwnerApi] Error in GET /policies/drafts:', err);
+      res.status(500).json({ error: 'Failed to retrieve policy proposals' });
+    }
+  });
+
+  // GET /policies/drafts/:id — Get proposal detail with lazy expiry
+  router.get('/policies/drafts/:id', (req: Request, res: Response): void => {
+    try {
+      const proposalId = req.params.id as string;
+      const proposal = repos.policyProposals.getById(proposalId);
+      if (!proposal) {
+        res.status(404).json({ error: 'PROPOSAL_NOT_FOUND', message: 'Policy proposal not found' });
+        return;
+      }
+
+      // Ownership verification
+      const currentOwnerId = req.ownerSession?.ownerId || 'default';
+      if (proposal.owner_id !== currentOwnerId) {
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Proposal belongs to another owner or session' });
+        return;
+      }
+
+      // Check lazy expiry
+      const nowIso = new Date().toISOString();
+      const isExpired = proposal.status === 'PENDING' && new Date(proposal.expires_at).getTime() <= Date.now();
+      let currentStatus = proposal.status;
+
+      if (isExpired) {
+        runInTransaction(db, () => {
+          repos.policyProposals.updateStatus(proposal.id, 'EXPIRED', nowIso);
+          writeAuditLogEntry(db, repos, {
+            actor: 'system',
+            event: 'POLICY_PROPOSAL_EXPIRED',
+            timestamp: nowIso,
+            payload: {
+              proposal_id: proposal.id,
+              base_version: proposal.base_version,
+            },
+          });
+        });
+        currentStatus = 'EXPIRED';
+      }
+
+      let rules: unknown = {};
+      let diff: unknown = [];
+      let relaxations: unknown = [];
+      let unsupportedRequests: unknown = [];
+      try { rules = JSON.parse(proposal.rules); } catch { rules = { raw: proposal.rules }; }
+      try { diff = JSON.parse(proposal.diff); } catch { diff = []; }
+      try { relaxations = JSON.parse(proposal.relaxations); } catch { relaxations = []; }
+      try { unsupportedRequests = JSON.parse(proposal.unsupported_requests); } catch { unsupportedRequests = []; }
+
+      res.status(200).json({
+        id: proposal.id,
+        baseVersion: proposal.base_version,
+        rules,
+        proposalHash: proposal.proposal_hash,
+        hasRelaxations: proposal.has_relaxations === 1,
+        relaxations,
+        diff,
+        explanation: proposal.explanation,
+        unsupportedRequests,
+        ownerId: proposal.owner_id,
+        status: currentStatus,
+        createdAt: proposal.created_at,
+        expiresAt: proposal.expires_at,
+        activatedAt: proposal.activated_at,
+        rejectedAt: proposal.rejected_at,
+      });
+    } catch (err: unknown) {
+      logger?.error?.('[OwnerApi] Error in GET /policies/drafts/:id:', err);
+      res.status(500).json({ error: 'Failed to retrieve proposal' });
+    }
+  });
+
+  // Proposal Activation endpoints
+  router.post('/policies/activate', (req: Request, res: Response) => handleProposalActivation(req, res));
+  router.post('/policies/drafts/:id/activate', (req: Request, res: Response) => handleProposalActivation(req, res, req.params.id as string));
+
+  // Proposal Rejection endpoints
+  router.post('/policies/reject', (req: Request, res: Response) => handleProposalRejection(req, res));
+  router.post('/policies/drafts/:id/reject', (req: Request, res: Response) => handleProposalRejection(req, res, req.params.id as string));
 
   // ==========================================================================
   // 7. Vendors (/api/vendors)

@@ -18,6 +18,8 @@ import type {
   ApprovalRow,
   AuditLogRow,
   AiRunRow,
+  PolicyProposalRow,
+  ProposalStatus,
 } from './types.js';
 
 export class Repositories {
@@ -152,14 +154,20 @@ export class Repositories {
     },
     setActive: (id: string): void => {
       // Transactional single-active switch protected by idx_policy_versions_single_active
-      const tx = this.db.transaction(() => {
+      const updateFn = (): void => {
         this.db.prepare('UPDATE policy_versions SET active = 0 WHERE active = 1').run();
         const res = this.db.prepare('UPDATE policy_versions SET active = 1 WHERE id = ?').run(id);
         if (res.changes === 0) {
           throw new Error(`Policy version with id ${id} not found`);
         }
-      });
-      tx.immediate();
+      };
+
+      if (this.db.inTransaction) {
+        updateFn();
+      } else {
+        const tx = this.db.transaction(updateFn);
+        tx.immediate();
+      }
     },
   };
 
@@ -490,6 +498,14 @@ export class Repositories {
     getById: (id: string): AiRunRow | undefined => {
       return this.db.prepare('SELECT * FROM ai_runs WHERE id = ?').get(id) as AiRunRow | undefined;
     },
+    findLatestValidCache: (inputHash: string, minCreatedAt: string): AiRunRow | undefined => {
+      return this.db.prepare(`
+        SELECT * FROM ai_runs
+        WHERE input_hash = ? AND status = 'SUCCESS' AND created_at >= ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(inputHash, minCreatedAt) as AiRunRow | undefined;
+    },
     insert: (run: AiRunRow): void => {
       this.db.prepare(`
         INSERT INTO ai_runs (id, kind, request_id, model, input_hash, output, latency_ms, status, created_at)
@@ -505,6 +521,79 @@ export class Repositories {
         run.status,
         run.created_at
       );
+    },
+  };
+
+  public readonly policyProposals = {
+    getById: (id: string): PolicyProposalRow | undefined => {
+      return this.db.prepare('SELECT * FROM policy_proposals WHERE id = ?').get(id) as PolicyProposalRow | undefined;
+    },
+    insert: (proposal: PolicyProposalRow): void => {
+      this.db.prepare(`
+        INSERT INTO policy_proposals (
+          id, base_version, rules, proposal_hash, has_relaxations,
+          relaxations, diff, explanation, unsupported_requests,
+          owner_id, status, created_at, expires_at, activated_at, rejected_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        proposal.id,
+        proposal.base_version,
+        proposal.rules,
+        proposal.proposal_hash,
+        proposal.has_relaxations,
+        proposal.relaxations,
+        proposal.diff,
+        proposal.explanation,
+        proposal.unsupported_requests,
+        proposal.owner_id,
+        proposal.status,
+        proposal.created_at,
+        proposal.expires_at,
+        proposal.activated_at ?? null,
+        proposal.rejected_at ?? null
+      );
+    },
+    updateStatus: (
+      id: string,
+      status: ProposalStatus,
+      timestampIso: string
+    ): boolean => {
+      const field = status === 'ACTIVATED' ? 'activated_at' : status === 'REJECTED' ? 'rejected_at' : null;
+      if (field) {
+        const res = this.db.prepare(`
+          UPDATE policy_proposals
+          SET status = ?, ${field} = ?
+          WHERE id = ? AND status = 'PENDING'
+        `).run(status, timestampIso, id);
+        return res.changes > 0;
+      }
+      const res = this.db.prepare(`
+        UPDATE policy_proposals
+        SET status = ?
+        WHERE id = ? AND status = 'PENDING'
+      `).run(status, id);
+      return res.changes > 0;
+    },
+    list: (options?: { ownerId?: string; status?: ProposalStatus; limit?: number }): PolicyProposalRow[] => {
+      const limit = Math.min(Math.max(1, options?.limit ?? 50), 100);
+      if (options?.ownerId && options?.status) {
+        return this.db.prepare(
+          'SELECT * FROM policy_proposals WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?'
+        ).all(options.ownerId, options.status, limit) as PolicyProposalRow[];
+      }
+      if (options?.ownerId) {
+        return this.db.prepare(
+          'SELECT * FROM policy_proposals WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?'
+        ).all(options.ownerId, limit) as PolicyProposalRow[];
+      }
+      if (options?.status) {
+        return this.db.prepare(
+          'SELECT * FROM policy_proposals WHERE status = ? ORDER BY created_at DESC LIMIT ?'
+        ).all(options.status, limit) as PolicyProposalRow[];
+      }
+      return this.db.prepare(
+        'SELECT * FROM policy_proposals ORDER BY created_at DESC LIMIT ?'
+      ).all(limit) as PolicyProposalRow[];
     },
   };
 }

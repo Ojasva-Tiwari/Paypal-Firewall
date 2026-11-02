@@ -5,6 +5,7 @@ import {
   resetConfig,
   ConfigError,
   SANDBOX_BASE_URL,
+  DEFAULT_AI_MODEL,
 } from '../../src/config/index.js';
 import { MAX_MINOR_UNITS } from '../../src/core/money.js';
 
@@ -46,7 +47,8 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(config.reseedOnBoot).toBe(false);
 
       expect(config.aiProvider).toBe('mock');
-      expect(config.aiModel).toBe('gemini-1.5-flash');
+      expect(config.aiModel).toBe('gemini-3.8-flash');
+      expect(config.aiModel).toBe(DEFAULT_AI_MODEL);
       expect(config.aiScanMode).toBe('advisory');
 
       expect(config.sessionSecret).toBe('payguard-default-dev-session-secret-min16');
@@ -73,6 +75,15 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       });
       expect(config.port).toBe(4000);
       expect(config.publicBaseUrl).toBe('https://payguard.example.com');
+    });
+
+    it('should allow user-configurable AI_MODEL override while defaulting to gemini-3.8-flash', () => {
+      const defaultConfig = loadConfig({});
+      expect(defaultConfig.aiModel).toBe('gemini-3.8-flash');
+      expect(defaultConfig.aiModel).toBe(DEFAULT_AI_MODEL);
+
+      const customConfig = loadConfig({ AI_MODEL: 'gemini-3.8-pro' });
+      expect(customConfig.aiModel).toBe('gemini-3.8-pro');
     });
   });
 
@@ -219,11 +230,12 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
     });
 
     it('should validate AI_SCAN_MODE enum values', () => {
+      expect(loadConfig({ AI_SCAN_MODE: 'off' }).aiScanMode).toBe('off');
       expect(loadConfig({ AI_SCAN_MODE: 'advisory' }).aiScanMode).toBe('advisory');
       expect(loadConfig({ AI_SCAN_MODE: 'enforce' }).aiScanMode).toBe('enforce');
 
       expect(() => loadConfig({ AI_SCAN_MODE: 'strict' })).toThrow(ConfigError);
-      expect(() => loadConfig({ AI_SCAN_MODE: 'off' })).toThrow(ConfigError);
+      expect(() => loadConfig({ AI_SCAN_MODE: 'invalid' })).toThrow(ConfigError);
     });
 
     it('should parse RESEED_ON_BOOT boolean flag', () => {
