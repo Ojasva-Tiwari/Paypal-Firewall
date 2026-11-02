@@ -185,6 +185,7 @@ export interface McpServerOptions {
   readonly staticDir?: string;
   readonly config?: PayGuardConfig;
   readonly aiService?: AiService;
+  readonly trustProxy?: boolean | number | string;
 }
 
 export interface PayGuardMcpServerInstance {
@@ -350,6 +351,11 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
 
   // Express HTTP Application
   const app = express();
+
+  // Configurable, secure trust proxy setting (Requirement 10, default: false)
+  const trustProxy = options.trustProxy ?? options.config?.trustProxy ?? false;
+  app.set('trust proxy', trustProxy);
+
   app.use(express.json({ limit: '64kb' }));
 
   // Handle payload too large or invalid JSON errors without exposing internals

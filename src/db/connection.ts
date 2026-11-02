@@ -45,14 +45,15 @@ export function createDatabase(options?: string | DatabaseOptions): DatabaseInst
     }
   }
 
-  const dbOptions: Database.Options = typeof options === 'object' ? {
-    readonly: options.readonly,
-    fileMustExist: options.fileMustExist,
-    timeout: options.timeout ?? 5000,
-    verbose: options.verbose,
-  } : {
+  const dbOptions: Database.Options = {
     timeout: 5000,
   };
+  if (typeof options === 'object') {
+    if (options.readonly !== undefined) dbOptions.readonly = options.readonly;
+    if (options.fileMustExist !== undefined) dbOptions.fileMustExist = options.fileMustExist;
+    if (options.timeout !== undefined) dbOptions.timeout = options.timeout;
+    if (options.verbose !== undefined) dbOptions.verbose = options.verbose;
+  }
 
   const db = new Database(dbPath, dbOptions);
 

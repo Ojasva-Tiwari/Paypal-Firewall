@@ -59,6 +59,7 @@ export interface PayGuardConfig {
   readonly aiScanMode: 'off' | 'advisory' | 'enforce';
   readonly telegramBotToken?: string;
   readonly telegramOwnerChatId?: string;
+  readonly trustProxy: boolean | number | string;
 }
 
 /**
@@ -140,6 +141,20 @@ const RawEnvSchema = z
     AI_SCAN_MODE: z.enum(['off', 'advisory', 'enforce'] as const).default('advisory'),
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_OWNER_CHAT_ID: z.string().optional(),
+    TRUST_PROXY: z
+      .string()
+      .optional()
+      .default('false')
+      .transform((val) => {
+        const trimmed = val.trim();
+        if (trimmed === '' || trimmed.toLowerCase() === 'false') return false;
+        if (trimmed.toLowerCase() === 'true') return true;
+        const parsed = Number(trimmed);
+        if (Number.isInteger(parsed) && parsed >= 0 && String(parsed) === trimmed) {
+          return parsed;
+        }
+        return trimmed;
+      }),
   })
   .refine(
     (data) => {
@@ -217,6 +232,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     aiScanMode: data.AI_SCAN_MODE,
     telegramBotToken: data.TELEGRAM_BOT_TOKEN?.trim() || undefined,
     telegramOwnerChatId: data.TELEGRAM_OWNER_CHAT_ID?.trim() || undefined,
+    trustProxy: data.TRUST_PROXY,
   };
 }
 
