@@ -60,6 +60,7 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(config.geminiApiKey).toBeUndefined();
       expect(config.telegramBotToken).toBeUndefined();
       expect(config.telegramOwnerChatId).toBeUndefined();
+      expect(config.trustProxy).toBe(false);
     });
 
     it('should derive publicBaseUrl from custom PORT if PUBLIC_BASE_URL is omitted', () => {
@@ -244,6 +245,30 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(loadConfig({ RESEED_ON_BOOT: 'false' }).reseedOnBoot).toBe(false);
       expect(loadConfig({ RESEED_ON_BOOT: 'random' }).reseedOnBoot).toBe(false);
       expect(loadConfig({}).reseedOnBoot).toBe(false);
+    });
+  });
+
+  describe('Express Trust Proxy Configuration', () => {
+    it('should default to false when TRUST_PROXY is omitted or empty', () => {
+      expect(loadConfig({}).trustProxy).toBe(false);
+      expect(loadConfig({ TRUST_PROXY: '' }).trustProxy).toBe(false);
+      expect(loadConfig({ TRUST_PROXY: 'false' }).trustProxy).toBe(false);
+    });
+
+    it('should parse boolean true when TRUST_PROXY is "true"', () => {
+      expect(loadConfig({ TRUST_PROXY: 'true' }).trustProxy).toBe(true);
+      expect(loadConfig({ TRUST_PROXY: ' TRUE ' }).trustProxy).toBe(true);
+    });
+
+    it('should parse numeric hop count when TRUST_PROXY is an integer', () => {
+      expect(loadConfig({ TRUST_PROXY: '1' }).trustProxy).toBe(1);
+      expect(loadConfig({ TRUST_PROXY: '2' }).trustProxy).toBe(2);
+    });
+
+    it('should preserve custom string when TRUST_PROXY is a subnet or CIDR', () => {
+      expect(loadConfig({ TRUST_PROXY: 'loopback' }).trustProxy).toBe('loopback');
+      expect(loadConfig({ TRUST_PROXY: '10.0.0.0/8' }).trustProxy).toBe('10.0.0.0/8');
+      expect(loadConfig({ TRUST_PROXY: 'loopback, 10.0.0.0/8' }).trustProxy).toBe('loopback, 10.0.0.0/8');
     });
   });
 
