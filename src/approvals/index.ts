@@ -6,3 +6,4 @@
 export * from './tokens.js';
 export * from './routes.js';
 export * from './expiry.js';
+export * from './service.js';

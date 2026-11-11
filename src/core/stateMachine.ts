@@ -332,6 +332,40 @@ export function writeAuditLogEntry(
 }
 
 /**
+ * Appends a hash-chained audit log entry only if the latest audit entry for
+ * the target request differs in actor, event, or canonical payload.
+ */
+export function writeAuditLogEntryIfChanged(
+  db: Database,
+  repos: Repositories,
+  params: WriteAuditParams & { readonly requestId: string }
+): AuditLogRow | undefined {
+  const execute = (): AuditLogRow | undefined => {
+    const existingLogs = repos.auditLog.listByRequestId(params.requestId);
+    const lastEntry = existingLogs[existingLogs.length - 1];
+    const normalizedPayload = serializeAuditPayload(params.payload);
+
+    if (
+      lastEntry &&
+      lastEntry.event === params.event &&
+      lastEntry.actor === params.actor &&
+      serializeAuditPayload(lastEntry.payload) === normalizedPayload
+    ) {
+      return undefined;
+    }
+
+    return writeAuditLogEntry(db, repos, params);
+  };
+
+  if (db.inTransaction) {
+    return execute();
+  }
+
+  const tx = db.transaction(execute);
+  return tx.immediate();
+}
+
+/**
  * Atomically transitions a payment request to a new status and appends
  * an audit log row within the SAME transaction (Hard Rule 7 & Invariant I2).
  *

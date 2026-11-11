@@ -43,7 +43,7 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
     db = createDatabase(':memory:');
     runMigrations(db);
     repos = new Repositories(db);
-    sessionStore = new OwnerSessionStore();
+    sessionStore = new OwnerSessionStore({ db, repos });
 
     // 1. Seed Owner
     repos.owners.upsert({
@@ -145,12 +145,13 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
   function seedHeldPaymentRequest(options?: {
     id?: string;
     amountMinor?: number;
+    currency?: string;
     expiresAt?: string;
     status?: string;
   }) {
     const requestId = options?.id ?? `req-held-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const amountMinor = toMinorUnits(options?.amountMinor ?? 2500); // $25.00
-    const currency = 'USD';
+    const currency = options?.currency ?? 'USD';
     const purpose = 'Database infrastructure credits';
     const category = 'cloud';
     const nowIso = new Date().toISOString();
@@ -784,16 +785,37 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
         }),
       ]);
 
-      // Exactly ONE succeeds (200), and the other fails (400 INVALID_REQUEST_STATUS)
+      // Exactly ONE succeeds (200), and the other fails with 409 (TOKEN_ALREADY_USED from sibling invalidation)
       const statuses = [resApprove.status, resVoid.status];
-      expect(statuses).toContain(200);
+      expect(statuses.filter((s) => s === 200)).toHaveLength(1);
+      expect(statuses.filter((s) => s === 409)).toHaveLength(1);
 
-      const non200Status = statuses.find((s) => s !== 200);
-      expect(non200Status).toBe(400);
+      const winningRes = resApprove.status === 200 ? resApprove : resVoid;
+      const losingRes = resApprove.status === 409 ? resApprove : resVoid;
 
-      // Verify the final request status in DB is consistent
+      expect(winningRes.status).toBe(200);
+      expect(losingRes.status).toBe(409);
+
+      const losingData = (await losingRes.json()) as { success: boolean; error: string; message: string };
+      expect(losingData.success).toBe(false);
+      expect(losingData.error).toBe('TOKEN_ALREADY_USED');
+      expect(losingData.error).not.toBe('INVALID_REQUEST_STATUS');
+
+      // Verify the final request status in DB and ensure non-winning action never executed
       const finalRequest = repos.paymentRequests.getById(requestId);
-      expect(['CAPTURED', 'VOIDED']).toContain(finalRequest?.status);
+      const ledgerEntries = repos.ledger.listByRequestId(requestId);
+      const normalizedLedgerKinds = ledgerEntries.map((l) => l.kind).sort();
+
+      if (finalRequest?.status === 'CAPTURED') {
+        expect(mockAuthorizationsService.captureAuthorization).toHaveBeenCalledTimes(1);
+        expect(mockAuthorizationsService.voidAuthorization).not.toHaveBeenCalled();
+        expect(normalizedLedgerKinds).toEqual(['RESERVE', 'SPEND'].sort());
+      } else {
+        expect(finalRequest?.status).toBe('VOIDED');
+        expect(mockAuthorizationsService.voidAuthorization).toHaveBeenCalledTimes(1);
+        expect(mockAuthorizationsService.captureAuthorization).not.toHaveBeenCalled();
+        expect(normalizedLedgerKinds).toEqual(['RELEASE', 'RESERVE'].sort());
+      }
     });
   });
 
@@ -1304,6 +1326,240 @@ describe('M4-T3: Approval & Void HTTP Flow (GET /a/:token, POST /approve, POST /
 
       // Once CONFIRMED, request is no longer returned in listNeedingReconciliation
       expect(repos.paymentRequests.listNeedingReconciliation().map((r) => r.id)).not.toContain(requestId);
+    });
+  });
+
+  // ============================================================================
+  // 6. Browser HTML & URL-Encoded Form Approval Flow
+  // ============================================================================
+
+  describe('6. Browser HTML & URL-Encoded Form Approval Flow', () => {
+    const browserAccept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+
+    it('renders sanitized HTML sign-in prompt on unauthenticated or expired browser GET /a/:token', async () => {
+      const { requestId } = seedHeldPaymentRequest({ amountMinor: 4250 });
+      const mintRes = mintApprovalToken(db, repos, { requestId, action: 'APPROVE' });
+      const rawToken = mintRes.rawToken!;
+
+      // Unauthenticated browser request with standard Accept header (*/* included)
+      const unauthRes = await fetch(`${baseUrl}/a/${rawToken}`, {
+        headers: { Accept: browserAccept },
+      });
+      expect(unauthRes.status).toBe(401);
+      expect(unauthRes.headers.get('content-type')).toContain('text/html');
+      const unauthHtml = await unauthRes.text();
+      expect(unauthHtml).toContain('Owner Sign-In Required');
+      expect(unauthHtml).toContain('href="/"');
+      expect(unauthHtml).toContain('Continue to Approval Review');
+      expect(unauthHtml).not.toContain(rawToken);
+      expect(unauthHtml).not.toContain('42.50');
+      expect(unauthHtml).not.toContain('Acme Cloud Hosting');
+
+      // Expired/invalid session cookie -> clears cookie and renders expired prompt
+      const expiredRes = await fetch(`${baseUrl}/a/${rawToken}`, {
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=expired-token-value`,
+        },
+      });
+      expect(expiredRes.status).toBe(401);
+      expect(expiredRes.headers.get('content-type')).toContain('text/html');
+      expect(expiredRes.headers.get('set-cookie')).toContain(`${OWNER_COOKIE_NAME}=;`);
+      const expiredHtml = await expiredRes.text();
+      expect(expiredHtml).toContain('Owner Session Expired or Invalid');
+      expect(expiredHtml).toContain('href="/"');
+      expect(expiredHtml).not.toContain(rawToken);
+    });
+
+    it('renders CSP-compliant approval HTML with hidden _csrf input and currency-aware display for browser Accept headers', async () => {
+      const cases = [
+        { currency: 'USD', expectedSnippet: '$25.00<span class="currency">USD</span>' },
+        { currency: 'EUR', expectedSnippet: '€25.00<span class="currency">EUR</span>' },
+        { currency: 'GBP', expectedSnippet: '£25.00<span class="currency">GBP</span>' },
+        { currency: 'INR', expectedSnippet: '₹25.00<span class="currency">INR</span>' },
+        { currency: 'CAD', expectedSnippet: '<div class="amount">25.00<span class="currency">CAD</span></div>' },
+      ];
+
+      for (const testCase of cases) {
+        const { requestId } = seedHeldPaymentRequest({ currency: testCase.currency });
+        const mintRes = mintApprovalToken(db, repos, { requestId, action: 'APPROVE' });
+        const rawToken = mintRes.rawToken!;
+
+        const res = await fetch(`${baseUrl}/a/${rawToken}`, {
+          headers: {
+            Accept: browserAccept,
+            Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          },
+        });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toContain('text/html');
+        const html = await res.text();
+        expect(html).toContain(testCase.expectedSnippet);
+        expect(html).toContain(`<input type="hidden" name="_csrf" value="${ownerCsrf}">`);
+        expect(html).toContain(`action="/a/${rawToken}/approve"`);
+        expect(html).not.toContain('onsubmit=');
+        if (testCase.currency !== 'USD') {
+          expect(html).not.toContain('$25.00');
+        }
+      }
+    });
+
+    it('approves payment via HTML form POST with _csrf body, renders HTML confirmation, and blocks replay', async () => {
+      const { requestId } = seedHeldPaymentRequest({ amountMinor: 3100, currency: 'EUR' });
+      const mintRes = mintApprovalToken(db, repos, { requestId, action: 'APPROVE' });
+      const rawToken = mintRes.rawToken!;
+
+      const formRes = await fetch(`${baseUrl}/a/${rawToken}/approve`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: ownerCsrf }).toString(),
+      });
+
+      expect(formRes.status).toBe(200);
+      expect(formRes.headers.get('content-type')).toContain('text/html');
+      const formHtml = await formRes.text();
+      expect(formHtml).toContain('Payment Approved &amp; Captured');
+      expect(formHtml).toContain(requestId);
+      expect(formHtml).toContain('CAPTURE-SUCCESS-999');
+
+      expect(repos.paymentRequests.getById(requestId)?.status).toBe('CAPTURED');
+      expect(repos.approvals.getByTokenHash(mintRes.tokenHash!)?.used_at).not.toBeNull();
+      expect(repos.ledger.listByRequestId(requestId).map((l) => l.kind)).toEqual(['RESERVE', 'SPEND']);
+      expect(mockAuthorizationsService.captureAuthorization).toHaveBeenCalledTimes(1);
+
+      // Replay form POST is rejected 409 HTML and captureAuthorization is still called only once
+      const replayPostRes = await fetch(`${baseUrl}/a/${rawToken}/approve`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: ownerCsrf }).toString(),
+      });
+      expect(replayPostRes.status).toBe(409);
+      expect(replayPostRes.headers.get('content-type')).toContain('text/html');
+      expect(await replayPostRes.text()).toContain('TOKEN_ALREADY_USED');
+      expect(mockAuthorizationsService.captureAuthorization).toHaveBeenCalledTimes(1);
+
+      // Subsequent browser GET is rejected 410 HTML
+      const replayGetRes = await fetch(`${baseUrl}/a/${rawToken}`, {
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+        },
+      });
+      expect(replayGetRes.status).toBe(410);
+      expect(replayGetRes.headers.get('content-type')).toContain('text/html');
+      expect(await replayGetRes.text()).toContain('Approval Link No Longer Active');
+    });
+
+    it('voids payment hold via HTML form POST with _csrf body and blocks replay', async () => {
+      const { requestId } = seedHeldPaymentRequest();
+      const mintRes = mintApprovalToken(db, repos, { requestId, action: 'VOID' });
+      const rawToken = mintRes.rawToken!;
+
+      const formRes = await fetch(`${baseUrl}/a/${rawToken}/void`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: ownerCsrf }).toString(),
+      });
+
+      expect(formRes.status).toBe(200);
+      expect(formRes.headers.get('content-type')).toContain('text/html');
+      const formHtml = await formRes.text();
+      expect(formHtml).toContain('Payment Hold Voided');
+      expect(formHtml).toContain(requestId);
+
+      expect(repos.paymentRequests.getById(requestId)?.status).toBe('VOIDED');
+      expect(repos.approvals.getByTokenHash(mintRes.tokenHash!)?.used_at).not.toBeNull();
+      expect(repos.ledger.listByRequestId(requestId).map((l) => l.kind)).toEqual(['RESERVE', 'RELEASE']);
+      expect(mockAuthorizationsService.voidAuthorization).toHaveBeenCalledTimes(1);
+
+      const replayRes = await fetch(`${baseUrl}/a/${rawToken}/void`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: ownerCsrf }).toString(),
+      });
+      expect(replayRes.status).toBe(409);
+      expect(replayRes.headers.get('content-type')).toContain('text/html');
+      expect(await replayRes.text()).toContain('TOKEN_ALREADY_USED');
+    });
+
+    it('fails closed when form CSRF is invalid/missing, JSON carries _csrf without header, or action mismatches', async () => {
+      const { requestId } = seedHeldPaymentRequest();
+      const mintApprove = mintApprovalToken(db, repos, { requestId, action: 'APPROVE' });
+      const rawApprove = mintApprove.rawToken!;
+
+      // 1. Missing _csrf in URL-encoded form body -> 403 HTML
+      const missingCsrfRes = await fetch(`${baseUrl}/a/${rawApprove}/approve`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: '',
+      });
+      expect(missingCsrfRes.status).toBe(403);
+      expect(missingCsrfRes.headers.get('content-type')).toContain('text/html');
+      expect(await missingCsrfRes.text()).toContain('Security Verification Failed');
+
+      // 2. Wrong _csrf in URL-encoded form body -> 403 HTML
+      const wrongCsrfRes = await fetch(`${baseUrl}/a/${rawApprove}/approve`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: 'wrong-csrf-token' }).toString(),
+      });
+      expect(wrongCsrfRes.status).toBe(403);
+
+      // 3. JSON body containing _csrf WITHOUT x-csrf-token header -> MUST fail 403
+      const jsonBodyCsrfRes = await fetch(`${baseUrl}/a/${rawApprove}/approve`, {
+        method: 'POST',
+        headers: {
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ _csrf: ownerCsrf }),
+      });
+      expect(jsonBodyCsrfRes.status).toBe(403);
+
+      // Token and request remain untouched
+      expect(repos.approvals.getByTokenHash(mintApprove.tokenHash!)?.used_at).toBeNull();
+      expect(repos.paymentRequests.getById(requestId)?.status).toBe('HELD');
+      expect(mockAuthorizationsService.captureAuthorization).not.toHaveBeenCalled();
+
+      // 4. Form POST submitting APPROVE token to /void -> 400 HTML ACTION_MISMATCH, token preserved
+      const mismatchRes = await fetch(`${baseUrl}/a/${rawApprove}/void`, {
+        method: 'POST',
+        headers: {
+          Accept: browserAccept,
+          Cookie: `${OWNER_COOKIE_NAME}=${ownerToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ _csrf: ownerCsrf }).toString(),
+      });
+      expect(mismatchRes.status).toBe(400);
+      expect(mismatchRes.headers.get('content-type')).toContain('text/html');
+      expect(await mismatchRes.text()).toContain('ACTION_MISMATCH');
+      expect(repos.approvals.getByTokenHash(mintApprove.tokenHash!)?.used_at).toBeNull();
+      expect(mockAuthorizationsService.voidAuthorization).not.toHaveBeenCalled();
     });
   });
 });

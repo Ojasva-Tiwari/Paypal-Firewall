@@ -71,6 +71,13 @@ interface OrderResponse {
   links?: Array<{ href: string; rel: string; method: string }>;
 }
 
+function maskTokenForLog(tokenId: string): string {
+  if (!tokenId || tokenId.length <= 4) {
+    return '****';
+  }
+  return `${'*'.repeat(tokenId.length - 4)}${tokenId.slice(-4)}`;
+}
+
 function getCredentials(): { clientId: string; clientSecret: string; vaultTokenId: string } {
   const clientId = process.env.CONNECTOR_ACME_CLIENT_ID || process.env.PAYPAL_CLIENT_ID;
   const clientSecret = process.env.CONNECTOR_ACME_CLIENT_SECRET || process.env.PAYPAL_CLIENT_SECRET;
@@ -80,8 +87,12 @@ function getCredentials(): { clientId: string; clientSecret: string; vaultTokenI
     process.exit(1);
   }
 
-  // Check command line arg, env var, or fallback to verified US Personal S2 token
-  const vaultTokenId = process.argv[2] || process.env.VAULT_TOKEN_ID || 'tok-sandbox-example-0001';
+  // Require explicit CLI argument or environment variable (never hardcode real Vault token IDs)
+  const vaultTokenId = (process.argv[2] || process.env.VAULT_TOKEN_ID || '').trim();
+  if (!vaultTokenId) {
+    console.error('\n[Error] Missing VAULT_TOKEN_ID. Pass a Sandbox vault token via CLI arg or VAULT_TOKEN_ID env var.');
+    process.exit(1);
+  }
 
   return { clientId, clientSecret, vaultTokenId };
 }
@@ -175,7 +186,7 @@ async function main() {
 
   const { clientId, clientSecret, vaultTokenId } = getCredentials();
 
-  console.log(`[Config] Using Vault Token ID: ${vaultTokenId}`);
+  console.log(`[Config] Using Vault Token ID: ${maskTokenForLog(vaultTokenId)}`);
   console.log('[1/3] Obtaining OAuth 2.0 access token from sandbox...');
   const accessToken = await getOAuthToken(clientId, clientSecret);
   console.log('      OAuth access token retrieved successfully [REDACTED].\n');

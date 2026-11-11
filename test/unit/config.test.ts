@@ -6,6 +6,9 @@ import {
   ConfigError,
   SANDBOX_BASE_URL,
   DEFAULT_AI_MODEL,
+  DEFAULT_MAX_HARD_CAP_MINOR,
+  sanitizePublicBaseUrl,
+  validateHardCapWithinCeiling,
 } from '../../src/config/index.js';
 import { MAX_MINOR_UNITS } from '../../src/core/money.js';
 
@@ -47,7 +50,7 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(config.reseedOnBoot).toBe(false);
 
       expect(config.aiProvider).toBe('mock');
-      expect(config.aiModel).toBe('gemini-3.8-flash');
+      expect(config.aiModel).toBe('gemini-3.5-flash-lite');
       expect(config.aiModel).toBe(DEFAULT_AI_MODEL);
       expect(config.aiScanMode).toBe('advisory');
 
@@ -58,7 +61,10 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(config.demoAgentApiKey).toBeUndefined();
       expect(config.vaultTokenId).toBeUndefined();
       expect(config.geminiApiKey).toBeUndefined();
+      expect(config.telegramMode).toBe('disabled');
       expect(config.telegramBotToken).toBeUndefined();
+      expect(config.telegramBotUsername).toBeUndefined();
+      expect(config.telegramWebhookSecret).toBeUndefined();
       expect(config.telegramOwnerChatId).toBeUndefined();
       expect(config.trustProxy).toBe(false);
     });
@@ -69,18 +75,62 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(config.publicBaseUrl).toBe('http://localhost:8080');
     });
 
-    it('should support explicit PUBLIC_BASE_URL override', () => {
+    it('should support explicit PUBLIC_BASE_URL override and normalize trailing slashes', () => {
       const config = loadConfig({
         PORT: '4000',
-        PUBLIC_BASE_URL: 'https://payguard.example.com',
+        PUBLIC_BASE_URL: 'https://payguard.example.com///',
       });
       expect(config.port).toBe(4000);
       expect(config.publicBaseUrl).toBe('https://payguard.example.com');
     });
 
-    it('should allow user-configurable AI_MODEL override while defaulting to gemini-3.8-flash', () => {
+    it('should return undefined publicBaseUrl in production when PUBLIC_BASE_URL is omitted (never localhost fallback)', () => {
+      const config = loadConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'prod-session-secret-at-least-32-chars-long',
+      });
+      expect(config.isProduction).toBe(true);
+      expect(config.publicBaseUrl).toBeUndefined();
+    });
+
+    it('should reject localhost/loopback PUBLIC_BASE_URL in production', () => {
+      for (const badUrl of [
+        'http://localhost:3000',
+        'https://localhost/app',
+        'http://127.0.0.1:8080',
+        'http://[::1]:3000',
+        'http://0.0.0.0:3000',
+      ]) {
+        expect(() =>
+          loadConfig({
+            NODE_ENV: 'production',
+            SESSION_SECRET: 'prod-session-secret-at-least-32-chars-long',
+            PUBLIC_BASE_URL: badUrl,
+          })
+        ).toThrow(ConfigError);
+      }
+    });
+
+    it('should accept valid external HTTPS PUBLIC_BASE_URL in production', () => {
+      const config = loadConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'prod-session-secret-at-least-32-chars-long',
+        PUBLIC_BASE_URL: 'https://guard.company.com/',
+      });
+      expect(config.publicBaseUrl).toBe('https://guard.company.com');
+    });
+
+    it('sanitizePublicBaseUrl strips trailing slashes and suppresses localhost in production', () => {
+      expect(sanitizePublicBaseUrl('http://localhost:3000/', false)).toBe('http://localhost:3000');
+      expect(sanitizePublicBaseUrl('http://localhost:3000/', true)).toBeUndefined();
+      expect(sanitizePublicBaseUrl('http://127.0.0.1:3000', true)).toBeUndefined();
+      expect(sanitizePublicBaseUrl('https://guard.company.com/', true)).toBe('https://guard.company.com');
+      expect(sanitizePublicBaseUrl(undefined, true)).toBeUndefined();
+    });
+
+    it('should allow user-configurable AI_MODEL override while defaulting to gemini-3.5-flash-lite', () => {
       const defaultConfig = loadConfig({});
-      expect(defaultConfig.aiModel).toBe('gemini-3.8-flash');
+      expect(defaultConfig.aiModel).toBe('gemini-3.5-flash-lite');
       expect(defaultConfig.aiModel).toBe(DEFAULT_AI_MODEL);
 
       const customConfig = loadConfig({ AI_MODEL: 'gemini-3.8-pro' });
@@ -210,6 +260,28 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(() => loadConfig({ MAX_HARD_CAP_MINOR: '1000000000' })).toThrow(ConfigError);
       expect(() => loadConfig({ MAX_HARD_CAP_MINOR: 'invalid' })).toThrow(ConfigError);
     });
+
+    it('validateHardCapWithinCeiling enforces boundary and rejects values above MAX_HARD_CAP_MINOR', () => {
+      expect(DEFAULT_MAX_HARD_CAP_MINOR).toBe(1_000_000);
+
+      expect(validateHardCapWithinCeiling(50000, 50000 as never).valid).toBe(true);
+      expect(validateHardCapWithinCeiling(49999, 50000 as never).valid).toBe(true);
+      expect(validateHardCapWithinCeiling(0, 50000 as never).valid).toBe(true);
+
+      const exceeded = validateHardCapWithinCeiling(50001, 50000 as never);
+      expect(exceeded.valid).toBe(false);
+      expect(exceeded.message).toContain('MAX_HARD_CAP_MINOR');
+
+      expect(validateHardCapWithinCeiling(-1, 50000 as never).valid).toBe(false);
+      expect(validateHardCapWithinCeiling(10.5, 50000 as never).valid).toBe(false);
+      expect(validateHardCapWithinCeiling(100, 0 as never).valid).toBe(false);
+      expect(validateHardCapWithinCeiling(100, (MAX_MINOR_UNITS + 1) as never).valid).toBe(false);
+
+      process.env.MAX_HARD_CAP_MINOR = '25000';
+      resetConfig();
+      expect(validateHardCapWithinCeiling(25000).valid).toBe(true);
+      expect(validateHardCapWithinCeiling(25001).valid).toBe(false);
+    });
   });
 
   describe('Enums and Option Validation', () => {
@@ -269,6 +341,55 @@ describe('Configuration & Environment Loader (M1-T1)', () => {
       expect(loadConfig({ TRUST_PROXY: 'loopback' }).trustProxy).toBe('loopback');
       expect(loadConfig({ TRUST_PROXY: '10.0.0.0/8' }).trustProxy).toBe('10.0.0.0/8');
       expect(loadConfig({ TRUST_PROXY: 'loopback, 10.0.0.0/8' }).trustProxy).toBe('loopback, 10.0.0.0/8');
+    });
+  });
+
+  describe('Telegram Configuration Validation', () => {
+    it('defaults to disabled mode with undefined credentials', () => {
+      const config = loadConfig({});
+      expect(config.telegramMode).toBe('disabled');
+      expect(config.telegramBotToken).toBeUndefined();
+    });
+
+    it('requires TELEGRAM_BOT_TOKEN when TELEGRAM_MODE is webhook', () => {
+      expect(() =>
+        loadConfig({
+          TELEGRAM_MODE: 'webhook',
+        })
+      ).toThrow(ConfigError);
+    });
+
+    it('accepts valid webhook configuration with token, secret and username', () => {
+      const config = loadConfig({
+        TELEGRAM_MODE: 'webhook',
+        TELEGRAM_BOT_TOKEN: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11',
+        TELEGRAM_BOT_USERNAME: '@PayGuardBot',
+        TELEGRAM_WEBHOOK_SECRET: 'secret_webhook_token_123',
+      });
+
+      expect(config.telegramMode).toBe('webhook');
+      expect(config.telegramBotToken).toBe('123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11');
+      expect(config.telegramBotUsername).toBe('PayGuardBot'); // Stripped leading @
+      expect(config.telegramWebhookSecret).toBe('secret_webhook_token_123');
+    });
+
+    it('rejects unsupported polling mode', () => {
+      expect(() =>
+        loadConfig({
+          TELEGRAM_MODE: 'polling',
+          TELEGRAM_BOT_TOKEN: 'valid-token',
+        })
+      ).toThrow(ConfigError);
+    });
+
+    it('rejects invalid TELEGRAM_WEBHOOK_SECRET containing illegal characters', () => {
+      expect(() =>
+        loadConfig({
+          TELEGRAM_MODE: 'webhook',
+          TELEGRAM_BOT_TOKEN: 'valid-token',
+          TELEGRAM_WEBHOOK_SECRET: 'illegal secret with spaces!',
+        })
+      ).toThrow(ConfigError);
     });
   });
 

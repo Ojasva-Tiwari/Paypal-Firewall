@@ -36,7 +36,8 @@ import {
 } from './types.js';
 import { InjectionDetector } from './injectionDetector.js';
 import { escapeDelimiters } from './riskExplainer.js';
-import { toMinorUnits, MAX_MINOR_UNITS } from '../core/money.js';
+import { toMinorUnits, MAX_MINOR_UNITS, type MinorUnits } from '../core/money.js';
+import { getConfig, validateHardCapWithinCeiling } from '../config/index.js';
 import {
   PolicyDocumentSchema,
   currencyCodeSchema,
@@ -149,7 +150,7 @@ CRITICAL SECURITY & BEHAVIOR RULES:
 3. PayGuard supports ONLY the following deterministic firewall controls:
    - "currency_allowlist": Array of 3-letter ISO uppercase currency codes (e.g. ["USD", "EUR", "INR"]).
    - "auto_limit_minor": Integer minor units. Payments at or below this amount auto-approve instantly. Payments above trigger human review (HOLD).
-   - "hard_cap_minor": Integer minor units. Payments above this amount are strictly DENIED. Must be >= auto_limit_minor.
+   - "hard_cap_minor": Integer minor units. Payments above this amount are strictly DENIED. Must be >= auto_limit_minor and <= max_hard_cap_minor.
    - "agent_daily_budget_minor": Integer minor units. Rolling 24h spend limit per individual agent.
    - "global_daily_budget_minor": Integer minor units. Rolling 24h spend limit across all agents.
    - "velocity": Object with "max_requests" (integer >= 1) and "window_minutes" (integer >= 1).
@@ -171,7 +172,7 @@ CRITICAL SECURITY & BEHAVIOR RULES:
    - If the user asks for rules PayGuard cannot deterministically enforce (e.g. "Only allow payments on Tuesdays", "Manager sign-off for GPU purchases", "Block vendors without a website"), DO NOT invent fields or hallucinate features.
    - Instead, list each unsupported instruction in "unsupported_requests" with a clear explanation of why it cannot be mapped.
 7. INVARIANTS:
-   - "hard_cap_minor" must always be greater than or equal to "auto_limit_minor".
+   - "hard_cap_minor" must always be greater than or equal to "auto_limit_minor" and must not exceed "max_hard_cap_minor".
 8. Output MUST strictly match the JSON schema.`;
 
 // ============================================================================
@@ -207,10 +208,15 @@ export interface PolicyDiffItem {
   readonly isRelaxation: boolean;
 }
 
+export interface PolicyDrafterOptions {
+  readonly maxHardCapMinor?: MinorUnits;
+}
+
 export interface PolicyDraftInput {
   readonly prompt: string;
   readonly activePolicy: Omit<PolicyDocument, 'version'> & { version?: number };
   readonly baseVersion?: number;
+  readonly maxHardCapMinor?: MinorUnits;
 }
 
 export interface PolicyDraftResult {
@@ -724,12 +730,15 @@ export function analyzePolicyDiff(
 
 export class PolicyDrafter {
   private readonly injectionDetector: InjectionDetector;
+  private readonly maxHardCapMinor?: MinorUnits;
 
   constructor(
     private readonly aiService: AiService,
-    injectionDetector?: InjectionDetector
+    injectionDetector?: InjectionDetector,
+    options?: PolicyDrafterOptions
   ) {
     this.injectionDetector = injectionDetector ?? new InjectionDetector(aiService);
+    this.maxHardCapMinor = options?.maxHardCapMinor;
   }
 
   /**
@@ -782,6 +791,19 @@ export class PolicyDrafter {
     }
 
     const { version: _actV, ...activeClean } = activeParse.data;
+    const effectiveMaxHardCapMinor =
+      input.maxHardCapMinor ?? this.maxHardCapMinor ?? getConfig().maxHardCapMinor;
+
+    if (
+      !Number.isInteger(effectiveMaxHardCapMinor) ||
+      effectiveMaxHardCapMinor < 1 ||
+      effectiveMaxHardCapMinor > MAX_MINOR_UNITS
+    ) {
+      throw new PolicyDrafterError(
+        'RULE_CONSTRAINT_VIOLATION',
+        `Configured MAX_HARD_CAP_MINOR ceiling (${String(effectiveMaxHardCapMinor)}) is invalid`
+      );
+    }
 
     // 3. Critical Security Requirement: Injection Detection in enforce mode
     const injectionScan = await this.injectionDetector.scan({
@@ -814,6 +836,7 @@ export class PolicyDrafter {
 
     const promptContext = {
       base_version: baseVersion,
+      max_hard_cap_minor: effectiveMaxHardCapMinor,
       active_policy: activeClean,
     };
 
@@ -927,6 +950,18 @@ Return structured JSON matching the schema.`;
     }
 
     const { version: _finalV, ...validatedProposedRules } = validatedProposalParse.data;
+
+    const ceilingCheck = validateHardCapWithinCeiling(
+      validatedProposedRules.hard_cap_minor,
+      effectiveMaxHardCapMinor
+    );
+    if (!ceilingCheck.valid) {
+      throw new PolicyDrafterError(
+        'RULE_CONSTRAINT_VIOLATION',
+        `Proposed policy violates firewall constraints: ${ceilingCheck.message}`,
+        [ceilingCheck.message ?? 'hard_cap_minor exceeds MAX_HARD_CAP_MINOR']
+      );
+    }
 
     // 8. Compute Deterministic Policy Diff & Relaxation Metadata
     const diffResult = analyzePolicyDiff(activeClean, validatedProposedRules);

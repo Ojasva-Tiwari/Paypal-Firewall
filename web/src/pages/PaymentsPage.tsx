@@ -64,9 +64,14 @@ export function PaymentsPage({ onSelectRequest }: PaymentsPageProps) {
   const filterTabs = [
     { id: 'ALL', label: 'All Requests' },
     { id: 'HELD', label: 'Held' },
+    { id: 'AUTO_EXECUTING', label: 'Auto Executing' },
+    { id: 'APPROVED', label: 'Approved' },
+    { id: 'CAPTURING', label: 'Capturing' },
     { id: 'CAPTURED', label: 'Captured' },
-    { id: 'DENIED', label: 'Denied' },
+    { id: 'FAILED', label: 'Failed' },
+    { id: 'EXPIRED', label: 'Expired' },
     { id: 'VOIDED', label: 'Voided' },
+    { id: 'DENIED', label: 'Denied' },
   ];
 
   return (
@@ -175,11 +180,41 @@ export function PaymentsPage({ onSelectRequest }: PaymentsPageProps) {
               >
                 {/* Left: Vendor, Agent, Purpose */}
                 <div className="space-y-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-sm text-[var(--text-primary)] group-hover:text-[var(--text-primary)] transition-colors truncate">
                       {req.vendorName}
                     </span>
                     <Badge status={req.status} />
+                    {(req.remoteVoidStatus === 'PENDING' || req.remoteVoidStatus === 'FAILED') && (
+                      <span
+                        className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-medium uppercase border ${
+                          req.remoteVoidStatus === 'FAILED'
+                            ? 'bg-[var(--status-error-bg)] text-[var(--status-error)] border-[var(--status-error-border)]'
+                            : 'bg-[var(--status-warn-bg)] text-[var(--status-warn)] border-[var(--status-warn-border)]'
+                        }`}
+                        title={`Remote PayPal void status: ${req.remoteVoidStatus}`}
+                      >
+                        Void {req.remoteVoidStatus}
+                      </span>
+                    )}
+                    {(req.paypalCaptureId || req.paypalAuthorizationId || req.paypalOrderId) && (
+                      <span
+                        className="hidden sm:inline-block px-2 py-0.5 rounded-md font-mono text-[10px] bg-[var(--elevated-bg)] text-[var(--text-secondary)] border border-[var(--border-color)]"
+                        title={`PayPal ${
+                          req.paypalCaptureId
+                            ? `Capture: ${req.paypalCaptureId}`
+                            : req.paypalAuthorizationId
+                            ? `Authorization: ${req.paypalAuthorizationId}`
+                            : `Order: ${req.paypalOrderId}`
+                        }`}
+                      >
+                        {req.paypalCaptureId
+                          ? `Cap ${req.paypalCaptureId.slice(-8)}`
+                          : req.paypalAuthorizationId
+                          ? `Auth ${req.paypalAuthorizationId.slice(-8)}`
+                          : `Ord ${req.paypalOrderId!.slice(-8)}`}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 text-xs text-[var(--text-secondary)]">
                     <span className="flex items-center gap-1">

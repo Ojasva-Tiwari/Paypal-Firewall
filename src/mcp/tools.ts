@@ -42,12 +42,25 @@ import type { PayGuardConfig } from '../config/index.js';
 import type { AiService } from '../ai/service.js';
 import { InjectionDetector, type InjectionDetectionResult } from '../ai/injectionDetector.js';
 import { writeAuditLogEntry } from '../core/stateMachine.js';
+import { enqueueSecurityNotification } from '../telegram/notifications.js';
+import { expirePaymentHold } from '../approvals/expiry.js';
+import type { ApprovalExecutionService } from '../approvals/service.js';
+import type { PayPalAuthorizationsService } from '../paypal/authorizations.js';
 import * as crypto from 'node:crypto';
 
 export interface RequestPaymentHandlerOptions extends ExecuteDecisionOptions {
   readonly config?: PayGuardConfig;
   readonly aiService?: AiService;
   readonly injectionDetector?: InjectionDetector;
+  readonly telegramEncryptionKey?: string;
+}
+
+export interface GetPaymentStatusHandlerOptions {
+  readonly authorizationsService?: PayPalAuthorizationsService;
+  readonly approvalExecutionService?: ApprovalExecutionService;
+  readonly now?: Date;
+  readonly publicBaseUrl?: string;
+  readonly isProduction?: boolean;
 }
 
 interface ScanAuditParams {
@@ -209,8 +222,14 @@ function getNextStep(decision: string | null, status: string): string {
   if (status === 'CAPTURED') {
     return 'Payment successfully captured. No further action needed.';
   }
+  if (status === 'AUTO_EXECUTING' || status === 'APPROVED' || status === 'CAPTURING') {
+    return 'Payment execution is in progress or pending reconciliation. Check status using get_payment_status with request_id before taking any further action.';
+  }
   if (status === 'HELD') {
     return 'Payment is placed on hold awaiting human review and approval by the account owner. Check status later using get_payment_status with request_id. Do not resubmit with altered parameters.';
+  }
+  if (status === 'EXPIRED' || status === 'VOIDED') {
+    return 'Payment hold expired or was voided and the budget reservation was released. No funds were captured.';
   }
   if (decision === 'DENY' || status === 'DENIED') {
     return 'DENIED decisions are final; do not retry with altered parameters.';
@@ -320,9 +339,21 @@ export async function handleRequestPayment(
           .digest('hex'),
       });
 
-      if (scanMode === 'enforce') {
-        if (injectionResult.outcome === 'DETECTED') {
+      if (injectionResult.outcome === 'DETECTED') {
+        if (scanMode === 'enforce') {
           aiFlags = ['PROMPT_INJECTION_DETECTED'];
+        }
+
+        const agentRow = repos.agents.getById(agentId);
+        try {
+          enqueueSecurityNotification(db, repos, {
+            agentId,
+            agentName: agentRow?.name ?? agentId,
+            ruleName: 'PROMPT_INJECTION_DETECTED',
+            purpose: input.purpose,
+          });
+        } catch {
+          // Never block payment processing if notification enqueue fails
         }
       }
       // Advisory mode: scan runs and persists, but aiFlags remains undefined (never alters deterministic policy)
@@ -331,6 +362,25 @@ export async function handleRequestPayment(
       // Fail-open for AI scan errors: baseline safety never depends on AI being up
       aiFlags = undefined;
     }
+  }
+
+  const forwardedUrlOptions: { publicBaseUrl?: string; isProduction?: boolean } = {};
+  if (options && 'publicBaseUrl' in options) {
+    forwardedUrlOptions.publicBaseUrl = options.publicBaseUrl;
+  } else if (options?.config) {
+    forwardedUrlOptions.publicBaseUrl = options.config.publicBaseUrl;
+  }
+  if (options && 'isProduction' in options) {
+    forwardedUrlOptions.isProduction = options.isProduction;
+  } else if (options?.config) {
+    forwardedUrlOptions.isProduction = options.config.isProduction;
+  }
+
+  const forwardedCryptoOptions: { telegramEncryptionKey?: string } = {};
+  if (options && 'telegramEncryptionKey' in options) {
+    forwardedCryptoOptions.telegramEncryptionKey = options.telegramEncryptionKey;
+  } else if (options?.config) {
+    forwardedCryptoOptions.telegramEncryptionKey = options.config.telegramEncryptionKey;
   }
 
   // 3. Transactional evaluation and reservation (Flow A, B, E)
@@ -349,6 +399,8 @@ export async function handleRequestPayment(
         sourceContext: input.source_context,
         autoExecute,
         aiFlags,
+        ...forwardedUrlOptions,
+        ...forwardedCryptoOptions,
       },
       repos
     );
@@ -418,7 +470,7 @@ export async function handleRequestPayment(
       try {
         const execRes = await executeDecision(
           { requestId: evalResult.request.id },
-          { db, repos, ...options }
+          { db, repos, ...options, ...forwardedUrlOptions }
         );
         currentStatus = execRes.status;
       } catch {
@@ -436,11 +488,13 @@ export async function handleRequestPayment(
       try {
         const execRes = await executeDecision(
           { requestId: evalResult.request.id },
-          { db, repos, ...options }
+          { db, repos, ...options, ...forwardedUrlOptions }
         );
         currentStatus = execRes.status;
       } catch {
-        currentStatus = 'HELD';
+        // Re-read authoritative status from database after failure/ambiguity
+        const updated = repos.paymentRequests.getById(evalResult.request.id);
+        currentStatus = updated?.status ?? 'FAILED';
       }
     }
   }
@@ -448,8 +502,16 @@ export async function handleRequestPayment(
   let userMessage = 'Payment evaluated successfully.';
   if (currentStatus === 'CAPTURED') {
     userMessage = 'Payment captured successfully via PayPal sandbox.';
+  } else if (
+    currentStatus === 'AUTO_EXECUTING' ||
+    currentStatus === 'APPROVED' ||
+    currentStatus === 'CAPTURING'
+  ) {
+    userMessage = 'Payment execution is in progress and awaiting PayPal confirmation or reconciliation.';
   } else if (currentStatus === 'HELD') {
     userMessage = 'Payment placed on hold: awaiting human review and approval by the account owner.';
+  } else if (currentStatus === 'EXPIRED' || currentStatus === 'VOIDED') {
+    userMessage = 'Payment hold expired or was voided without capture.';
   } else if (decision === 'DENY' || currentStatus === 'DENIED') {
     userMessage = 'Payment denied by policy firewall.';
   } else if (currentStatus === 'FAILED') {
@@ -482,9 +544,10 @@ export async function handleRequestPayment(
 // ============================================================================
 
 export async function handleGetPaymentStatus(
-  _db: Database,
+  db: Database,
   args: unknown,
-  repositories?: Repositories
+  repositories?: Repositories,
+  options?: GetPaymentStatusHandlerOptions
 ): Promise<ToolResult> {
   const parseResult = getPaymentStatusInputSchema.safeParse(args);
   if (!parseResult.success) {
@@ -494,13 +557,13 @@ export async function handleGetPaymentStatus(
     };
   }
 
-  const repos = repositories!;
+  const repos = repositories ?? createRepositories(db);
   const { agentId } = getAuthenticatedAgent();
   const requestId = parseResult.data.request_id;
-  const request = repos.paymentRequests.getById(requestId);
+  const initialRequest = repos.paymentRequests.getById(requestId);
 
   // Enforce tenant isolation & request ownership: reject if non-existent or owned by another agent
-  if (!request || request.agent_id !== agentId) {
+  if (!initialRequest || initialRequest.agent_id !== agentId) {
     return {
       content: [
         {
@@ -510,6 +573,31 @@ export async function handleGetPaymentStatus(
       ],
       isError: true,
     };
+  }
+
+  // Synchronously settle expired holds if expires_at has elapsed so the requesting agent
+  // observes the authoritative EXPIRED/VOIDED state and freed budget without waiting for cron polling.
+  let request = initialRequest;
+  const now = options?.now ?? new Date();
+  const expiresAtMs = initialRequest.expires_at ? new Date(initialRequest.expires_at).getTime() : 0;
+  if (initialRequest.status === 'HELD' && expiresAtMs > 0 && expiresAtMs <= now.getTime()) {
+    try {
+      if (options?.approvalExecutionService && !options.now) {
+        await options.approvalExecutionService.expireHoldTracked(initialRequest.id);
+      } else {
+        await expirePaymentHold(db, initialRequest.id, {
+          repos,
+          authorizationsService: options?.authorizationsService,
+          now,
+          ...(options && 'publicBaseUrl' in options ? { publicBaseUrl: options.publicBaseUrl } : {}),
+          ...(options && 'isProduction' in options ? { isProduction: options.isProduction } : {}),
+        });
+      }
+      request = repos.paymentRequests.getById(initialRequest.id) ?? initialRequest;
+    } catch {
+      // Fail-safe: return authoritative persisted state without leaking internal errors
+      request = repos.paymentRequests.getById(initialRequest.id) ?? initialRequest;
+    }
   }
 
   const reasons = request.reasons ? JSON.parse(request.reasons) : [];
@@ -609,7 +697,7 @@ export async function handleGetBudget(
 // ============================================================================
 
 export async function handleListVendors(
-  _db: Database,
+  db: Database,
   args: unknown,
   repositories?: Repositories
 ): Promise<ToolResult> {
@@ -621,7 +709,7 @@ export async function handleListVendors(
     };
   }
 
-  const repos = repositories!;
+  const repos = repositories ?? createRepositories(db);
 
   // Only list ACTIVE and UNVERIFIED vendors; BLOCKED vendors are strictly excluded
   const allVendors = repos.vendors.listAll();

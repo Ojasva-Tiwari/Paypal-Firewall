@@ -24,12 +24,15 @@ import {
   OWNER_COOKIE_NAME,
   DEFAULT_ABSOLUTE_TIMEOUT_MS,
   OwnerSessionStore,
+  SessionOwnerNotFoundError,
   LoginRateLimiter,
   verifyOwnerPassphrase,
   hashOwnerPassphrase,
   getSafeClientIp,
   createOwnerAuthMiddleware,
   parseCookies,
+  resolveOwnerCookieSecureFlag,
+  buildOwnerSessionCookieOptions,
 } from '../auth/owner.js';
 
 export interface AuthRouterOptions {
@@ -39,17 +42,29 @@ export interface AuthRouterOptions {
   readonly loginRateLimiter?: LoginRateLimiter;
   readonly isProduction?: boolean;
   readonly secureCookie?: boolean;
+  readonly logger?: {
+    info?: (msg: string, ...args: unknown[]) => void;
+    warn?: (msg: string, ...args: unknown[]) => void;
+    error?: (msg: string, ...args: unknown[]) => void;
+  };
 }
 
 export function createAuthRouter(options: AuthRouterOptions): Router {
   const router = Router();
+  const db = options.db;
   const repos = options.repos;
-  const sessionStore = options.sessionStore ?? new OwnerSessionStore();
+  const sessionStore = options.sessionStore ?? new OwnerSessionStore({ db, repos });
   const loginRateLimiter = options.loginRateLimiter ?? new LoginRateLimiter();
-  const isProduction = options.isProduction ?? process.env.NODE_ENV === 'production';
-  const secureCookie = options.secureCookie !== undefined ? options.secureCookie : isProduction;
+  const secureCookie = resolveOwnerCookieSecureFlag({
+    isProduction: options.isProduction,
+    secureCookie: options.secureCookie,
+  });
+  const cookieBaseOptions = buildOwnerSessionCookieOptions(secureCookie);
 
-  const ownerAuthMiddleware = createOwnerAuthMiddleware(sessionStore);
+  const ownerAuthMiddleware = createOwnerAuthMiddleware(sessionStore, {
+    isProduction: options.isProduction,
+    secureCookie,
+  });
 
   // ==========================================================================
   // POST /login — Owner Login & Session Issuance
@@ -57,8 +72,8 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
   router.post('/login', async (req: Request, res: Response): Promise<void> => {
     const clientIp = getSafeClientIp(req);
 
-    // 1. Enforce Login Rate Limiting (~5 attempts / minute)
-    const rateCheck = loginRateLimiter.check(clientIp);
+    // 1. Atomically check & reserve login attempt slot BEFORE input checks / Argon2 verification (no TOCTOU race)
+    const rateCheck = loginRateLimiter.consume(clientIp);
     if (!rateCheck.allowed) {
       res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
       res.status(429).json({
@@ -70,19 +85,29 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
     // 2. Validate input payload
     const rawPassphrase = req.body?.passphrase;
     if (typeof rawPassphrase !== 'string' || rawPassphrase.trim().length === 0) {
-      loginRateLimiter.recordAttempt(clientIp);
       res.status(400).json({ error: 'Passphrase is required' });
       return;
     }
 
     const passphrase = rawPassphrase;
 
-    // 3. Retrieve Authoritative Owner Record from Database
-    const owner = repos.owners.get();
+    // 3. Retrieve Authoritative Owner Record from Database (fail closed 503 if storage unavailable)
+    let owner: ReturnType<typeof repos.owners.get>;
+    try {
+      owner = repos.owners.get();
+    } catch (err: unknown) {
+      options.logger?.warn?.(
+        `[Auth] Owner storage unavailable during login: ${err instanceof Error ? err.message : String(err)}`
+      );
+      res.status(503).json({
+        error: 'Session storage unavailable. Please try again later.',
+      });
+      return;
+    }
+
     if (!owner || !owner.passphrase_hash) {
       // Dummy check to mitigate timing side-channels
       await verifyOwnerPassphrase(passphrase, '$argon2id$dummy-hash-for-timing-defense');
-      loginRateLimiter.recordAttempt(clientIp);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -90,47 +115,55 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
     // 4. Verify Passphrase (supports Argon2id and controlled legacy migration)
     const { valid, needsMigration } = await verifyOwnerPassphrase(passphrase, owner.passphrase_hash);
     if (!valid) {
-      loginRateLimiter.recordAttempt(clientIp);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
 
-    // 5. Immediate Legacy Hash Migration: Rehash with Argon2id and persist to database
+    // 5. Immediate Legacy Hash Migration: Rehash with Argon2id and update passphrase_hash ONLY
+    // Preserves telegram_chat_id, telegram_user_id, telegram_username, telegram_linked_at, and display_name
     if (needsMigration) {
       try {
         const modernArgon2Hash = await hashOwnerPassphrase(passphrase);
-        repos.owners.upsert({
-          id: 'default',
-          display_name: owner.display_name,
-          passphrase_hash: modernArgon2Hash,
-          telegram_chat_id: owner.telegram_chat_id,
-          created_at: owner.created_at,
-        });
+        repos.owners.updatePassphraseHash(modernArgon2Hash, owner.id);
       } catch {
-        // Non-fatal: login proceeds, migration will retry on next login
+        // Non-fatal: login proceeds if session storage works; migration retries on next login
       }
     }
 
-    // 6. Session Fixation Defense: Invalidate pre-existing incoming session token
+    // 6. Session Fixation Defense & 7. Issue Fresh Durable Session
     const existingCookies = parseCookies(req.headers.cookie);
     const existingToken = existingCookies[OWNER_COOKIE_NAME];
-    if (existingToken) {
-      sessionStore.invalidateSession(existingToken);
-    }
 
-    // 7. Issue Fresh Cryptographically Secure Session & CSRF Token
-    const { rawSessionToken, csrfToken } = sessionStore.createSession({
-      id: owner.id,
-      displayName: owner.display_name,
-    });
+    let rawSessionToken: string;
+    let csrfToken: string;
+    try {
+      if (existingToken) {
+        sessionStore.invalidateSession(existingToken);
+      }
+      const created = sessionStore.createSession({
+        id: owner.id,
+        displayName: owner.display_name,
+      });
+      rawSessionToken = created.rawSessionToken;
+      csrfToken = created.csrfToken;
+    } catch (err: unknown) {
+      if (err instanceof SessionOwnerNotFoundError) {
+        res.status(401).json({ error: 'Invalid credentials' });
+        return;
+      }
+      options.logger?.warn?.(
+        `[Auth] Session storage failure during login: ${err instanceof Error ? err.message : String(err)}`
+      );
+      res.status(503).json({
+        error: 'Session storage unavailable. Please try again later.',
+      });
+      return;
+    }
 
     // 8. Set HTTP-Only, SameSite=Strict Cookie
     res.cookie(OWNER_COOKIE_NAME, rawSessionToken, {
-      httpOnly: true,
-      sameSite: 'strict',
-      path: '/',
+      ...cookieBaseOptions,
       maxAge: DEFAULT_ABSOLUTE_TIMEOUT_MS,
-      secure: secureCookie,
     });
 
     // Reset rate limiter for successful login
@@ -155,15 +188,21 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
     const rawSessionToken = cookies[OWNER_COOKIE_NAME];
 
     if (rawSessionToken) {
-      sessionStore.invalidateSession(rawSessionToken);
+      try {
+        sessionStore.invalidateSession(rawSessionToken);
+      } catch (err: unknown) {
+        options.logger?.warn?.(
+          `[Auth] Session storage failure during logout: ${err instanceof Error ? err.message : String(err)}`
+        );
+        // Fail closed on storage failure without clearing the client's session cookie
+        res.status(503).json({
+          error: 'Session storage unavailable. Please try again later.',
+        });
+        return;
+      }
     }
 
-    res.clearCookie(OWNER_COOKIE_NAME, {
-      httpOnly: true,
-      sameSite: 'strict',
-      path: '/',
-      secure: secureCookie,
-    });
+    res.clearCookie(OWNER_COOKIE_NAME, cookieBaseOptions);
 
     res.status(200).json({ ok: true });
   });
@@ -180,9 +219,22 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
       return;
     }
 
-    const session = sessionStore.getSession(rawSessionToken);
+    let session: ReturnType<typeof sessionStore.getSession>;
+    try {
+      session = sessionStore.getSession(rawSessionToken);
+    } catch (err: unknown) {
+      options.logger?.warn?.(
+        `[Auth] Session storage failure during session check: ${err instanceof Error ? err.message : String(err)}`
+      );
+      // Fail closed on transient storage error without clearing the user's cookie
+      res.status(503).json({
+        error: 'Session storage unavailable. Please try again later.',
+      });
+      return;
+    }
+
     if (!session) {
-      res.clearCookie(OWNER_COOKIE_NAME, { path: '/' });
+      res.clearCookie(OWNER_COOKIE_NAME, cookieBaseOptions);
       res.status(200).json({ authenticated: false });
       return;
     }

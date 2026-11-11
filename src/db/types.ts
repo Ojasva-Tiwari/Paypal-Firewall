@@ -13,6 +13,9 @@ export interface OwnerRow {
   readonly display_name: string;
   readonly passphrase_hash: string;
   readonly telegram_chat_id: string | null;
+  readonly telegram_username?: string | null;
+  readonly telegram_linked_at?: string | null;
+  readonly telegram_user_id?: string | null;
   readonly created_at: string;
 }
 
@@ -147,4 +150,114 @@ export interface PolicyProposalRow {
   readonly expires_at: string;
   readonly activated_at?: string | null;
   readonly rejected_at?: string | null;
+}
+
+export interface TelegramLinkTokenRow {
+  readonly id: string;
+  readonly owner_id: string;
+  readonly token_hash: string;
+  readonly expires_at: string;
+  readonly used_at: string | null;
+  readonly created_at: string;
+}
+
+export type NotificationStatus =
+  | 'PENDING'
+  | 'PROCESSING'
+  | 'SENT'
+  | 'FAILED'
+  | 'DEAD'
+  | 'CANCELLED';
+
+export type NotificationEventType =
+  | 'PAYMENT_HELD'
+  | 'PAYMENT_DENIED'
+  | 'PAYMENT_VOIDED'
+  | 'PAYMENT_EXPIRED'
+  | 'PAYMENT_CAPTURED'
+  | 'PAYMENT_FAILED'
+  | 'PAYMENT_VOID_PENDING'
+  | 'PAYMENT_VOID_CONFIRMED'
+  | 'PAYMENT_VOID_FAILED'
+  | 'BUDGET_WARNING'
+  | 'SECURITY_HIGH_RISK'
+  | 'SECURITY_LINK_CONFLICT';
+
+export interface NotificationOutboxRow {
+  readonly id: string;
+  readonly event_type: NotificationEventType | string;
+  readonly recipient_chat_id: string;
+  readonly owner_id: string;
+  readonly linked_at: string;
+  readonly request_id: string | null;
+  readonly dedup_key: string;
+  readonly message_text: string;
+  readonly parse_mode: 'HTML' | 'None';
+  readonly status: NotificationStatus;
+  readonly attempt_count: number;
+  readonly max_attempts: number;
+  readonly next_attempt_at: string;
+  readonly claimed_at: string | null;
+  readonly claim_id: string | null;
+  readonly last_error: string | null;
+  readonly telegram_message_id: number | null;
+  readonly reply_markup_enc?: string | null;
+  readonly created_at: string;
+  readonly sent_at: string | null;
+}
+
+export interface EnqueueNotificationParams {
+  readonly id?: string;
+  readonly event_type: NotificationEventType | string;
+  readonly recipient_chat_id: string;
+  readonly owner_id: string;
+  readonly linked_at: string;
+  readonly request_id?: string | null;
+  readonly dedup_key: string;
+  readonly message_text: string;
+  readonly parse_mode?: 'HTML' | 'None';
+  readonly max_attempts?: number;
+  readonly next_attempt_at?: string;
+  readonly reply_markup_enc?: string | null;
+  readonly telegram_message_id?: number | null;
+  readonly created_at?: string;
+}
+
+export interface TelegramApprovalCallbackRow {
+  readonly id: string;
+  readonly token_hash: string;
+  readonly request_id: string;
+  readonly owner_id: string;
+  readonly action: 'APPROVE' | 'VOID';
+  readonly telegram_chat_id: string;
+  readonly telegram_user_id: string;
+  readonly snapshot_hash: string;
+  readonly expires_at: string;
+  readonly used_at: string | null;
+  readonly linked_at?: string | null;
+  readonly created_at: string;
+}
+
+export interface InsertTelegramApprovalCallbackParams {
+  readonly id?: string;
+  readonly token_hash: string;
+  readonly request_id: string;
+  readonly owner_id: string;
+  readonly action: 'APPROVE' | 'VOID';
+  readonly telegram_chat_id: string;
+  readonly telegram_user_id: string;
+  readonly snapshot_hash: string;
+  readonly expires_at: string;
+  readonly used_at?: string | null;
+  readonly linked_at: string;
+  readonly created_at?: string;
+}
+
+export interface OwnerSessionRow {
+  readonly session_key: string;
+  readonly owner_id: string;
+  readonly display_name: string;
+  readonly csrf_token: string;
+  readonly created_at: number;
+  readonly last_accessed_at: number;
 }

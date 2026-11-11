@@ -6,7 +6,9 @@
  * corresponding to the Section 8 data model.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
+import { runInTransaction } from './connection.js';
 import type {
   OwnerRow,
   AgentRow,
@@ -20,29 +22,151 @@ import type {
   AiRunRow,
   PolicyProposalRow,
   ProposalStatus,
+  TelegramLinkTokenRow,
+  NotificationOutboxRow,
+  EnqueueNotificationParams,
+  TelegramApprovalCallbackRow,
+  InsertTelegramApprovalCallbackParams,
+  OwnerSessionRow,
 } from './types.js';
 
 export class Repositories {
   constructor(private readonly db: Database) {}
 
   public readonly owners = {
-    get: (): OwnerRow | undefined => {
-      return this.db.prepare('SELECT * FROM owners WHERE id = ?').get('default') as OwnerRow | undefined;
+    get: (id = 'default'): OwnerRow | undefined => {
+      return this.db.prepare('SELECT * FROM owners WHERE id = ?').get(id) as OwnerRow | undefined;
     },
-    upsert: (owner: Omit<OwnerRow, 'id'> & { id?: 'default' }): void => {
+    getByTelegramChatId: (chatId: string): OwnerRow | undefined => {
+      return this.db
+        .prepare('SELECT * FROM owners WHERE telegram_chat_id = ?')
+        .get(String(chatId).trim()) as OwnerRow | undefined;
+    },
+    getByTelegramUserId: (userId: string): OwnerRow | undefined => {
+      return this.db
+        .prepare('SELECT * FROM owners WHERE telegram_user_id = ?')
+        .get(String(userId).trim()) as OwnerRow | undefined;
+    },
+    upsert: (owner: Omit<OwnerRow, 'id'> & { id?: string }): void => {
+      const ownerId = owner.id || 'default';
       this.db.prepare(`
-        INSERT INTO owners (id, display_name, passphrase_hash, telegram_chat_id, created_at)
-        VALUES ('default', ?, ?, ?, ?)
+        INSERT INTO owners (id, display_name, passphrase_hash, telegram_chat_id, telegram_user_id, telegram_username, telegram_linked_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           display_name = excluded.display_name,
           passphrase_hash = excluded.passphrase_hash,
-          telegram_chat_id = excluded.telegram_chat_id
+          telegram_chat_id = excluded.telegram_chat_id,
+          telegram_user_id = excluded.telegram_user_id,
+          telegram_username = excluded.telegram_username,
+          telegram_linked_at = excluded.telegram_linked_at
       `).run(
+        ownerId,
         owner.display_name,
         owner.passphrase_hash,
-        owner.telegram_chat_id,
+        owner.telegram_chat_id ?? null,
+        owner.telegram_user_id ?? null,
+        owner.telegram_username ?? null,
+        owner.telegram_linked_at ?? null,
         owner.created_at
       );
+    },
+    linkTelegram: (params: {
+      ownerId?: string;
+      chatId: string;
+      userId?: string | null;
+      username?: string | null;
+      linkedAtIso?: string;
+    }): void => {
+      const ownerId = params.ownerId || 'default';
+      const linkedAt = params.linkedAtIso || new Date().toISOString();
+      this.db.prepare(`
+        UPDATE owners
+        SET telegram_chat_id = ?,
+            telegram_user_id = ?,
+            telegram_username = ?,
+            telegram_linked_at = ?
+        WHERE id = ?
+      `).run(params.chatId, params.userId ?? null, params.username ?? null, linkedAt, ownerId);
+    },
+    unlinkTelegram: (ownerId = 'default'): void => {
+      this.db.prepare(`
+        UPDATE owners
+        SET telegram_chat_id = NULL,
+            telegram_user_id = NULL,
+            telegram_username = NULL,
+            telegram_linked_at = NULL
+        WHERE id = ?
+      `).run(ownerId);
+    },
+    updatePassphraseHash: (passphraseHash: string, ownerId = 'default'): boolean => {
+      const res = this.db
+        .prepare('UPDATE owners SET passphrase_hash = ? WHERE id = ?')
+        .run(passphraseHash, ownerId);
+      return res.changes > 0;
+    },
+  };
+
+  public readonly ownerSessions = {
+    insert: (session: OwnerSessionRow): void => {
+      this.db.prepare(`
+        INSERT INTO owner_sessions (
+          session_key, owner_id, display_name, csrf_token, created_at, last_accessed_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        session.session_key,
+        session.owner_id,
+        session.display_name,
+        session.csrf_token,
+        session.created_at,
+        session.last_accessed_at
+      );
+    },
+
+    getBySessionKey: (sessionKey: string): OwnerSessionRow | undefined => {
+      return this.db.prepare(`
+        SELECT s.session_key, s.owner_id, s.display_name, s.csrf_token, s.created_at, s.last_accessed_at
+        FROM owner_sessions s
+        INNER JOIN owners o ON o.id = s.owner_id
+        WHERE s.session_key = ?
+      `).get(sessionKey) as OwnerSessionRow | undefined;
+    },
+
+    touchLastAccessed: (sessionKey: string, lastAccessedAt: number): boolean => {
+      const res = this.db.prepare(`
+        UPDATE owner_sessions
+        SET last_accessed_at = ?
+        WHERE session_key = ?
+      `).run(lastAccessedAt, sessionKey);
+      return res.changes > 0;
+    },
+
+    deleteBySessionKey: (sessionKey: string): boolean => {
+      const res = this.db.prepare('DELETE FROM owner_sessions WHERE session_key = ?').run(sessionKey);
+      return res.changes > 0;
+    },
+
+    deleteByOwnerId: (ownerId: string): number => {
+      const res = this.db.prepare('DELETE FROM owner_sessions WHERE owner_id = ?').run(ownerId);
+      return res.changes;
+    },
+
+    deleteExpired: (idleCutoff: number, absoluteCutoff: number): number => {
+      const res = this.db.prepare(`
+        DELETE FROM owner_sessions
+        WHERE created_at < ? OR last_accessed_at < ?
+      `).run(absoluteCutoff, idleCutoff);
+      return res.changes;
+    },
+
+    count: (): number => {
+      const row = this.db.prepare('SELECT COUNT(*) as count FROM owner_sessions').get() as {
+        count: number;
+      };
+      return row.count;
+    },
+
+    clear: (): void => {
+      this.db.prepare('DELETE FROM owner_sessions').run();
     },
   };
 
@@ -105,7 +229,16 @@ export class Repositories {
 
   public readonly vendorVaultTokens = {
     getByVendorId: (vendorId: string): VendorVaultTokenRow | undefined => {
-      return this.db.prepare('SELECT * FROM vendor_vault_tokens WHERE vendor_id = ?').get(vendorId) as VendorVaultTokenRow | undefined;
+      return this.db
+        .prepare(
+          "SELECT * FROM vendor_vault_tokens WHERE vendor_id = ? AND status != 'REVOKED' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        )
+        .get(vendorId) as VendorVaultTokenRow | undefined;
+    },
+    listByVendorId: (vendorId: string): VendorVaultTokenRow[] => {
+      return this.db
+        .prepare('SELECT * FROM vendor_vault_tokens WHERE vendor_id = ? ORDER BY created_at DESC, rowid DESC')
+        .all(vendorId) as VendorVaultTokenRow[];
     },
     insert: (token: VendorVaultTokenRow): void => {
       this.db.prepare(`
@@ -128,6 +261,9 @@ export class Repositories {
   public readonly policyVersions = {
     getActive: (): PolicyVersionRow | undefined => {
       return this.db.prepare('SELECT * FROM policy_versions WHERE active = 1').get() as PolicyVersionRow | undefined;
+    },
+    getById: (id: string): PolicyVersionRow | undefined => {
+      return this.db.prepare('SELECT * FROM policy_versions WHERE id = ?').get(id) as PolicyVersionRow | undefined;
     },
     getByVersion: (version: number): PolicyVersionRow | undefined => {
       return this.db.prepare('SELECT * FROM policy_versions WHERE version = ?').get(version) as PolicyVersionRow | undefined;
@@ -284,15 +420,24 @@ export class Repositories {
         WHERE id = ?
       `).run(status, now, id);
     },
-    listNeedingReconciliation: (): PaymentRequestRow[] => {
+    listNeedingReconciliation: (nowIso?: string): PaymentRequestRow[] => {
+      const cutoff = nowIso || new Date().toISOString();
       return this.db
         .prepare(`
           SELECT * FROM payment_requests
-          WHERE status IN ('AUTO_EXECUTING', 'CAPTURING', 'HELD', 'APPROVED')
+          WHERE status IN ('AUTO_EXECUTING', 'CAPTURING', 'APPROVED')
+             OR (
+               status = 'HELD'
+               AND (
+                 paypal_authorization_id IS NULL
+                 OR TRIM(paypal_authorization_id) = ''
+                 OR (expires_at IS NOT NULL AND expires_at <= ?)
+               )
+             )
              OR remote_void_status IN ('PENDING', 'FAILED')
           ORDER BY created_at ASC
         `)
-        .all() as PaymentRequestRow[];
+        .all(cutoff) as PaymentRequestRow[];
     },
     listExpiredHeld: (nowIso?: string): PaymentRequestRow[] => {
       const cutoff = nowIso || new Date().toISOString();
@@ -441,7 +586,7 @@ export class Repositories {
       );
     },
     listByRequestId: (requestId: string): AuditLogRow[] => {
-      return this.db.prepare('SELECT * FROM audit_log WHERE request_id = ? ORDER BY ts ASC').all(requestId) as AuditLogRow[];
+      return this.db.prepare('SELECT * FROM audit_log WHERE request_id = ? ORDER BY ts ASC, rowid ASC').all(requestId) as AuditLogRow[];
     },
     getLastEntry: (): AuditLogRow | undefined => {
       return this.db.prepare('SELECT * FROM audit_log ORDER BY rowid DESC LIMIT 1').get() as AuditLogRow | undefined;
@@ -596,6 +741,521 @@ export class Repositories {
       ).all(limit) as PolicyProposalRow[];
     },
   };
+
+  public readonly telegramLinkTokens = {
+    getById: (id: string): TelegramLinkTokenRow | undefined => {
+      return this.db.prepare('SELECT * FROM telegram_link_tokens WHERE id = ?').get(id) as TelegramLinkTokenRow | undefined;
+    },
+    getByTokenHash: (tokenHash: string): TelegramLinkTokenRow | undefined => {
+      return this.db.prepare('SELECT * FROM telegram_link_tokens WHERE token_hash = ?').get(tokenHash) as TelegramLinkTokenRow | undefined;
+    },
+    insert: (token: TelegramLinkTokenRow): void => {
+      this.db.prepare(`
+        INSERT INTO telegram_link_tokens (id, owner_id, token_hash, expires_at, used_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        token.id,
+        token.owner_id,
+        token.token_hash,
+        token.expires_at,
+        token.used_at,
+        token.created_at
+      );
+    },
+    consume: (tokenHash: string, usedAtIso?: string): boolean => {
+      const usedAt = usedAtIso || new Date().toISOString();
+      const res = this.db.prepare(
+        'UPDATE telegram_link_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'
+      ).run(usedAt, tokenHash);
+      return res.changes > 0;
+    },
+    listByOwnerId: (ownerId: string): TelegramLinkTokenRow[] => {
+      return this.db.prepare(
+        'SELECT * FROM telegram_link_tokens WHERE owner_id = ? ORDER BY created_at DESC'
+      ).all(ownerId) as TelegramLinkTokenRow[];
+    },
+  };
+
+  public readonly notifications = {
+    enqueue: (entry: EnqueueNotificationParams): { inserted: boolean; id: string } => {
+      const id = entry.id ?? randomUUID();
+      const now = entry.created_at ?? new Date().toISOString();
+      const nextAttemptAt = entry.next_attempt_at ?? now;
+      const maxAttempts = entry.max_attempts ?? 3;
+      const parseMode = entry.parse_mode ?? 'HTML';
+
+      const res = this.db.prepare(`
+        INSERT OR IGNORE INTO notification_outbox (
+          id, event_type, recipient_chat_id, owner_id, linked_at,
+          request_id, dedup_key, message_text, parse_mode, status,
+          attempt_count, max_attempts, next_attempt_at, telegram_message_id, reply_markup_enc, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        entry.event_type,
+        entry.recipient_chat_id,
+        entry.owner_id,
+        entry.linked_at,
+        entry.request_id ?? null,
+        entry.dedup_key,
+        entry.message_text,
+        parseMode,
+        maxAttempts,
+        nextAttemptAt,
+        entry.telegram_message_id ?? null,
+        entry.reply_markup_enc ?? null,
+        now
+      );
+
+      return { inserted: res.changes > 0, id };
+    },
+
+    findActiveMessageIdForRequest: (params: {
+      readonly requestId: string;
+      readonly ownerId: string;
+      readonly recipientChatId: string;
+      readonly linkedAt: string;
+    }): number | null => {
+      const row = this.db
+        .prepare(`
+          SELECT telegram_message_id
+          FROM notification_outbox
+          WHERE request_id = ?
+            AND owner_id = ?
+            AND recipient_chat_id = ?
+            AND linked_at = ?
+            AND telegram_message_id IS NOT NULL
+            AND telegram_message_id > 0
+            AND status IN ('SENT', 'PROCESSING')
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `)
+        .get(
+          params.requestId,
+          params.ownerId,
+          params.recipientChatId,
+          params.linkedAt
+        ) as { telegram_message_id: number } | undefined;
+
+      return row?.telegram_message_id ?? null;
+    },
+
+    getById: (id: string): NotificationOutboxRow | undefined => {
+      return this.db.prepare('SELECT * FROM notification_outbox WHERE id = ?').get(id) as
+        | NotificationOutboxRow
+        | undefined;
+    },
+
+    getByDedupKey: (dedupKey: string): NotificationOutboxRow | undefined => {
+      return this.db
+        .prepare('SELECT * FROM notification_outbox WHERE dedup_key = ?')
+        .get(dedupKey) as NotificationOutboxRow | undefined;
+    },
+
+    updatePendingMessageByDedupKey: (dedupKey: string, messageText: string): boolean => {
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET message_text = ?
+        WHERE dedup_key = ? AND status = 'PENDING'
+      `).run(messageText, dedupKey);
+      return res.changes > 0;
+    },
+
+    countInWindow: (params: {
+      ownerId?: string;
+      eventType: string;
+      sinceIso: string;
+      statuses?: readonly string[];
+    }): number => {
+      if (params.statuses && params.statuses.length > 0) {
+        const placeholders = params.statuses.map(() => '?').join(',');
+        const query = params.ownerId
+          ? `SELECT COUNT(*) as count FROM notification_outbox
+             WHERE owner_id = ? AND event_type = ? AND status IN (${placeholders}) AND created_at >= ?`
+          : `SELECT COUNT(*) as count FROM notification_outbox
+             WHERE event_type = ? AND status IN (${placeholders}) AND created_at >= ?`;
+        const args = params.ownerId
+          ? [params.ownerId, params.eventType, ...params.statuses, params.sinceIso]
+          : [params.eventType, ...params.statuses, params.sinceIso];
+        const row = this.db.prepare(query).get(...args) as { count: number } | undefined;
+        return row?.count ?? 0;
+      }
+
+      const query = params.ownerId
+        ? `SELECT COUNT(*) as count FROM notification_outbox
+           WHERE owner_id = ? AND event_type = ? AND created_at >= ?`
+        : `SELECT COUNT(*) as count FROM notification_outbox
+           WHERE event_type = ? AND created_at >= ?`;
+      const args = params.ownerId
+        ? [params.ownerId, params.eventType, params.sinceIso]
+        : [params.eventType, params.sinceIso];
+      const row = this.db.prepare(query).get(...args) as { count: number } | undefined;
+      return row?.count ?? 0;
+    },
+
+    claimPending: (claimId: string, nowIso?: string, limit = 10): NotificationOutboxRow[] => {
+      const now = nowIso ?? new Date().toISOString();
+      return runInTransaction(this.db, () => {
+        const candidates = this.db.prepare(`
+          WITH eligible AS (
+            SELECT n.id, n.request_id, n.created_at, n.rowid,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY n.request_id
+                     ORDER BY n.created_at ASC, n.rowid ASC
+                   ) as rn
+            FROM notification_outbox n
+            WHERE n.status = 'PENDING' AND n.next_attempt_at <= ?
+              AND (
+                n.request_id IS NULL
+                OR NOT EXISTS (
+                  SELECT 1 FROM notification_outbox prev
+                  WHERE prev.request_id = n.request_id
+                    AND prev.id != n.id
+                    AND (
+                      prev.created_at < n.created_at
+                      OR (prev.created_at = n.created_at AND prev.rowid < n.rowid)
+                    )
+                    AND prev.status IN ('PENDING', 'PROCESSING')
+                )
+              )
+          )
+          SELECT id FROM eligible
+          WHERE request_id IS NULL OR rn = 1
+          ORDER BY created_at ASC, rowid ASC
+          LIMIT ?
+        `).all(now, limit) as { id: string }[];
+
+        if (candidates.length === 0) {
+          return [];
+        }
+
+        const ids = candidates.map(c => c.id);
+        const placeholders = ids.map(() => '?').join(',');
+        this.db.prepare(`
+          UPDATE notification_outbox
+          SET status = 'PROCESSING',
+              claim_id = ?,
+              claimed_at = ?
+          WHERE id IN (${placeholders}) AND status = 'PENDING'
+        `).run(claimId, now, ...ids);
+
+        return this.db.prepare(`
+          SELECT * FROM notification_outbox
+          WHERE claim_id = ? AND status = 'PROCESSING'
+          ORDER BY created_at ASC
+        `).all(claimId) as NotificationOutboxRow[];
+      });
+    },
+
+    reclaimAbandoned: (olderThanIso: string): number => {
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = 'PENDING',
+            claim_id = NULL,
+            claimed_at = NULL,
+            last_error = CASE
+              WHEN last_error IS NULL THEN 'LEASE_EXPIRED_RECLAIMED'
+              ELSE last_error || ' | LEASE_EXPIRED_RECLAIMED'
+            END
+        WHERE status = 'PROCESSING' AND claimed_at < ?
+      `).run(olderThanIso);
+      return res.changes;
+    },
+
+    markSent: (id: string, claimId: string, telegramMessageId: number, sentAtIso?: string): boolean => {
+      const sentAt = sentAtIso ?? new Date().toISOString();
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = 'SENT',
+            telegram_message_id = ?,
+            sent_at = ?,
+            last_error = NULL
+        WHERE id = ? AND claim_id = ? AND status = 'PROCESSING'
+          AND (last_error IS NULL OR last_error NOT LIKE '%SUPERSEDED_PENDING%')
+      `).run(telegramMessageId, sentAt, id, claimId);
+      return res.changes > 0;
+    },
+
+    markTerminalSentAndScheduleReattestation: (params: {
+      readonly id: string;
+      readonly claimId: string;
+      readonly telegramMessageId: number;
+      readonly row: NotificationOutboxRow;
+      readonly sentAtIso?: string;
+    }): boolean => {
+      const sentAt = params.sentAtIso ?? new Date().toISOString();
+      const sentAtMs = new Date(sentAt).getTime();
+
+      return runInTransaction(this.db, () => {
+        // Step 1: CAS transition of primary notification from PROCESSING -> SENT
+        const res = this.db.prepare(`
+          UPDATE notification_outbox
+          SET status = 'SENT',
+              telegram_message_id = ?,
+              sent_at = ?,
+              last_error = NULL
+          WHERE id = ? AND claim_id = ? AND status = 'PROCESSING'
+            AND (last_error IS NULL OR last_error NOT LIKE '%SUPERSEDED_PENDING%')
+        `).run(params.telegramMessageId, sentAt, params.id, params.claimId);
+
+        if (res.changes === 0) {
+          return false;
+        }
+
+        // Step 2: Atomic insertion of the three durable re-attestation passes
+        if (params.row.request_id && params.telegramMessageId > 0) {
+          const passes = [
+            { passNum: 1, delayMs: 15_000 },
+            { passNum: 2, delayMs: 45_000 },
+            { passNum: 3, delayMs: 105_000 },
+          ];
+
+          for (const pass of passes) {
+            const nextAttemptAt = new Date(sentAtMs + pass.delayMs).toISOString();
+            const dedupKey = `terminal_reattest:${params.row.request_id}:${pass.passNum}`;
+
+            this.db.prepare(`
+              INSERT OR IGNORE INTO notification_outbox (
+                id, event_type, recipient_chat_id, owner_id, linked_at,
+                request_id, dedup_key, message_text, parse_mode, status,
+                attempt_count, max_attempts, next_attempt_at, telegram_message_id, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 1, ?, ?, ?)
+            `).run(
+              randomUUID(),
+              params.row.event_type,
+              params.row.recipient_chat_id,
+              params.row.owner_id,
+              params.row.linked_at,
+              params.row.request_id,
+              dedupKey,
+              params.row.message_text,
+              params.row.parse_mode,
+              nextAttemptAt,
+              params.telegramMessageId,
+              sentAt
+            );
+          }
+        }
+
+        return true;
+      });
+    },
+
+    markFailed: (
+      id: string,
+      claimId: string,
+      nextAttemptAtIso: string,
+      error: string,
+      isTerminal = false
+    ): boolean => {
+      const sanitizedError = error.slice(0, 1000);
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = CASE
+              WHEN last_error LIKE '%SUPERSEDED_PENDING%' THEN 'CANCELLED'
+              WHEN ? = 1 OR (attempt_count + 1) >= max_attempts THEN 'DEAD'
+              ELSE 'PENDING'
+            END,
+            attempt_count = attempt_count + 1,
+            next_attempt_at = ?,
+            last_error = CASE
+              WHEN last_error LIKE '%SUPERSEDED_PENDING%' THEN ? || ' | SUPERSEDED'
+              ELSE ?
+            END,
+            claim_id = NULL,
+            claimed_at = NULL
+        WHERE id = ? AND claim_id = ? AND status = 'PROCESSING'
+      `).run(isTerminal ? 1 : 0, nextAttemptAtIso, sanitizedError, sanitizedError, id, claimId);
+      return res.changes > 0;
+    },
+
+    supersedeIntermediateForRequest: (requestId: string): { cancelled: number; cooperative: number } => {
+      // 1. Atomically cancel PENDING and FAILED intermediate rows
+      const res1 = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = 'CANCELLED',
+            last_error = CASE
+              WHEN last_error IS NOT NULL AND length(last_error) > 0 THEN last_error || ' | SUPERSEDED'
+              ELSE 'SUPERSEDED'
+            END,
+            claim_id = NULL,
+            claimed_at = NULL
+        WHERE request_id = ?
+          AND event_type IN ('PAYMENT_HELD', 'PAYMENT_VOID_PENDING')
+          AND status IN ('PENDING', 'FAILED')
+      `).run(requestId);
+
+      // 2. Mark active PROCESSING intermediate rows with cooperative flag
+      const res2 = this.db.prepare(`
+        UPDATE notification_outbox
+        SET last_error = CASE
+              WHEN last_error IS NOT NULL AND length(last_error) > 0 THEN last_error || ' | SUPERSEDED_PENDING'
+              ELSE 'SUPERSEDED_PENDING'
+            END
+        WHERE request_id = ?
+          AND event_type IN ('PAYMENT_HELD', 'PAYMENT_VOID_PENDING')
+          AND status = 'PROCESSING'
+      `).run(requestId);
+
+      return { cancelled: res1.changes, cooperative: res2.changes };
+    },
+
+    markCancelled: (id: string, reason = 'CANCELLED'): boolean => {
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = 'CANCELLED',
+            last_error = ?,
+            claim_id = NULL,
+            claimed_at = NULL
+        WHERE id = ? AND status IN ('PENDING', 'PROCESSING')
+      `).run(reason, id);
+      return res.changes > 0;
+    },
+
+    cancelPendingByOwnerId: (ownerId: string, reason = 'OWNER_UNLINKED'): number => {
+      const res = this.db.prepare(`
+        UPDATE notification_outbox
+        SET status = 'CANCELLED',
+            last_error = ?,
+            claim_id = NULL,
+            claimed_at = NULL
+        WHERE owner_id = ?
+          AND status IN ('PENDING', 'PROCESSING')
+      `).run(reason, ownerId);
+      return res.changes;
+    },
+
+    listRecent: (limit = 50, ownerId?: string): NotificationOutboxRow[] => {
+      if (ownerId) {
+        return this.db.prepare(`
+          SELECT * FROM notification_outbox
+          WHERE owner_id = ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(ownerId, limit) as NotificationOutboxRow[];
+      }
+      return this.db.prepare(`
+        SELECT * FROM notification_outbox
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(limit) as NotificationOutboxRow[];
+    },
+  };
+
+  public readonly telegramApprovalCallbacks = {
+    getById: (id: string): TelegramApprovalCallbackRow | undefined => {
+      return this.db
+        .prepare('SELECT * FROM telegram_approval_callbacks WHERE id = ?')
+        .get(id) as TelegramApprovalCallbackRow | undefined;
+    },
+
+    getByTokenHash: (tokenHash: string): TelegramApprovalCallbackRow | undefined => {
+      return this.db
+        .prepare('SELECT * FROM telegram_approval_callbacks WHERE token_hash = ?')
+        .get(tokenHash) as TelegramApprovalCallbackRow | undefined;
+    },
+
+    insert: (callback: InsertTelegramApprovalCallbackParams): TelegramApprovalCallbackRow => {
+      const id = callback.id || randomUUID();
+      const now = callback.created_at || new Date().toISOString();
+      this.db.prepare(`
+        INSERT INTO telegram_approval_callbacks (
+          id, token_hash, request_id, owner_id, action,
+          telegram_chat_id, telegram_user_id, snapshot_hash,
+          expires_at, used_at, linked_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        callback.token_hash,
+        callback.request_id,
+        callback.owner_id,
+        callback.action,
+        callback.telegram_chat_id,
+        callback.telegram_user_id,
+        callback.snapshot_hash,
+        callback.expires_at,
+        callback.used_at ?? null,
+        callback.linked_at ?? null,
+        now
+      );
+
+      return {
+        id,
+        token_hash: callback.token_hash,
+        request_id: callback.request_id,
+        owner_id: callback.owner_id,
+        action: callback.action,
+        telegram_chat_id: callback.telegram_chat_id,
+        telegram_user_id: callback.telegram_user_id,
+        snapshot_hash: callback.snapshot_hash,
+        expires_at: callback.expires_at,
+        used_at: callback.used_at ?? null,
+        linked_at: callback.linked_at ?? null,
+        created_at: now,
+      };
+    },
+
+    markUsed: (tokenHash: string, usedAtIso?: string): boolean => {
+      const usedAt = usedAtIso || new Date().toISOString();
+      const res = this.db.prepare(`
+        UPDATE telegram_approval_callbacks
+        SET used_at = ?
+        WHERE token_hash = ? AND used_at IS NULL
+      `).run(usedAt, tokenHash);
+      return res.changes > 0;
+    },
+
+    invalidateForRequest: (requestId: string, usedAtIso?: string): number => {
+      const usedAt = usedAtIso || new Date().toISOString();
+      const res = this.db.prepare(`
+        UPDATE telegram_approval_callbacks
+        SET used_at = ?
+        WHERE request_id = ? AND used_at IS NULL
+      `).run(usedAt, requestId);
+      return res.changes;
+    },
+
+    invalidateForOwner: (ownerId: string, usedAtIso?: string): number => {
+      const usedAt = usedAtIso || new Date().toISOString();
+      const res = this.db.prepare(`
+        UPDATE telegram_approval_callbacks
+        SET used_at = ?
+        WHERE owner_id = ? AND used_at IS NULL
+      `).run(usedAt, ownerId);
+      return res.changes;
+    },
+
+    listByRequestId: (requestId: string): TelegramApprovalCallbackRow[] => {
+      return this.db
+        .prepare('SELECT * FROM telegram_approval_callbacks WHERE request_id = ? ORDER BY created_at ASC')
+        .all(requestId) as TelegramApprovalCallbackRow[];
+    },
+
+    listActiveByRequestId: (requestId: string, nowIso?: string): TelegramApprovalCallbackRow[] => {
+      const now = nowIso || new Date().toISOString();
+      return this.db
+        .prepare(`
+          SELECT * FROM telegram_approval_callbacks
+          WHERE request_id = ? AND used_at IS NULL AND expires_at > ?
+          ORDER BY created_at ASC
+        `)
+        .all(requestId, now) as TelegramApprovalCallbackRow[];
+    },
+  };
+
+  /**
+   * Sibling and cross-channel invalidation: atomically invalidates all active
+   * dashboard approval tokens and Telegram callback tokens bound to a payment request.
+   */
+  public invalidateAllApprovalsForRequest(
+    requestId: string,
+    usedAtIso?: string
+  ): { webInvalidated: number; telegramInvalidated: number } {
+    const usedAt = usedAtIso || new Date().toISOString();
+    const webInvalidated = this.approvals.invalidateForRequest(requestId, usedAt);
+    const telegramInvalidated = this.telegramApprovalCallbacks.invalidateForRequest(requestId, usedAt);
+    return { webInvalidated, telegramInvalidated };
+  }
 }
 
 export function createRepositories(db: Database): Repositories {

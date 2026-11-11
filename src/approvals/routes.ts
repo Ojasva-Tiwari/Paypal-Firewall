@@ -12,14 +12,14 @@
  *    - Escapes all plain text; never renders raw agent or LLM HTML.
  *
  * 2. POST /a/:token/approve
- *    - Requires authenticated owner session + x-csrf-token header.
+ *    - Requires authenticated owner session + CSRF verification (x-csrf-token header or form _csrf).
  *    - Verifies token is bound to 'APPROVE'.
  *    - Atomically claims token consumption and transitions request HELD -> APPROVED in SQLite.
  *    - Calls executeDecision() in src/core for Flow C capture (the only money-moving caller).
  *    - Handles ambiguous outcomes gracefully with handoff to reconciliation.
  *
  * 3. POST /a/:token/void
- *    - Requires authenticated owner session + x-csrf-token header.
+ *    - Requires authenticated owner session + CSRF verification (x-csrf-token header or form _csrf).
  *    - Verifies token is bound to 'VOID'.
  *    - Atomically consumes token, inserts RELEASE ledger row, and transitions HELD -> VOIDED.
  *    - Voids remote PayPal authorization outside database transaction.
@@ -32,12 +32,9 @@
  * - Hard Rule 8: Fail closed on any error or ambiguity.
  */
 
-import { Router, type Request, type Response } from 'express';
+import express, { Router, type NextFunction, type Request, type Response } from 'express';
 import type { Database } from '../db/connection.js';
-import { runInTransaction } from '../db/connection.js';
 import type { Repositories } from '../db/repositories.js';
-import { transitionPaymentRequest, writeAuditLogEntry } from '../core/stateMachine.js';
-import { executeDecision, AmbiguousExecutionError, ExecuteDecisionError } from '../core/executeDecision.js';
 import { formatMinorUnitsToDecimal } from '../core/money.js';
 import type { PayPalOrdersService } from '../paypal/orders.js';
 import type { PayPalAuthorizationsService } from '../paypal/authorizations.js';
@@ -45,10 +42,7 @@ import type { OwnerSessionStore } from '../auth/owner.js';
 import { createOwnerAuthMiddleware } from '../auth/owner.js';
 import {
   verifyApprovalToken,
-  hashApprovalToken,
 } from './tokens.js';
-import { expirePaymentHold } from './expiry.js';
-import * as crypto from 'node:crypto';
 import {
   explainPolicyDecision,
   type PolicyExplanationItem,
@@ -56,6 +50,10 @@ import {
 import type { Decision } from '../policy/types.js';
 import type { AiService } from '../ai/service.js';
 import { RiskExplainer, type AiRiskExplanationResponse } from '../ai/riskExplainer.js';
+import {
+  ApprovalExecutionService,
+  ApprovalValidationError,
+} from './service.js';
 
 // ============================================================================
 // Types & Interfaces
@@ -65,9 +63,13 @@ export interface ApprovalRouterOptions {
   readonly db: Database;
   readonly repos: Repositories;
   readonly sessionStore: OwnerSessionStore;
+  readonly isProduction?: boolean;
+  readonly publicBaseUrl?: string;
+  readonly secureCookie?: boolean;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly ordersService?: PayPalOrdersService;
   readonly aiService?: AiService;
+  readonly approvalExecutionService?: ApprovalExecutionService;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -114,6 +116,99 @@ function escapeHtml(str: string | null | undefined): string {
     .replace(/'/g, '&#039;');
 }
 
+function prefersHtml(req: Request): boolean {
+  return req.accepts(['json', 'html']) === 'html';
+}
+
+function formatCurrencyPrefix(currency: string): string {
+  switch (currency.trim().toUpperCase()) {
+    case 'USD':
+      return '$';
+    case 'EUR':
+      return '€';
+    case 'GBP':
+      return '£';
+    case 'INR':
+      return '₹';
+    case 'JPY':
+      return '¥';
+    default:
+      return '';
+  }
+}
+
+function sendHtmlResponse(res: Response, statusCode: number, html: string): void {
+  res.status(statusCode);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+}
+
+interface ApprovalStatusHtmlOptions {
+  readonly badge: string;
+  readonly badgeTone: 'success' | 'warn' | 'error';
+  readonly title: string;
+  readonly message: string;
+  readonly details?: ReadonlyArray<{ readonly label: string; readonly value: string }>;
+  readonly backHref: string;
+  readonly backLabel: string;
+}
+
+function renderStatusHtml(opts: ApprovalStatusHtmlOptions): string {
+  const badgeStyle =
+    opts.badgeTone === 'success'
+      ? 'background: #064e3b; color: #a7f3d0;'
+      : opts.badgeTone === 'warn'
+      ? 'background: #854d0e; color: #fef08a;'
+      : 'background: #7f1d1d; color: #fecaca;';
+
+  const detailsHtml =
+    opts.details && opts.details.length > 0
+      ? opts.details
+          .map(
+            (item) => `
+    <div class="field">
+      <div class="label">${escapeHtml(item.label)}</div>
+      <div class="value">${escapeHtml(item.value)}</div>
+    </div>`
+          )
+          .join('')
+      : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PayGuard — ${escapeHtml(opts.title)}</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; }
+    body { margin: 0; padding: 1.5rem; display: flex; justify-content: center; align-items: center; min-height: 90vh; }
+    .card { background: #1e293b; border-radius: 1rem; border: 1px solid #334155; padding: 1.5rem; max-width: 440px; width: 100%; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); }
+    .badge { display: inline-block; padding: 0.25rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; ${badgeStyle} }
+    h1 { font-size: 1.35rem; margin: 1rem 0 0.75rem; color: #f8fafc; }
+    p { font-size: 0.95rem; color: #cbd5e1; line-height: 1.5; margin: 0 0 1.25rem; word-break: break-word; }
+    .field { margin-bottom: 0.85rem; }
+    .label { font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: #64748b; margin-bottom: 0.2rem; }
+    .value { font-size: 0.9rem; color: #e2e8f0; line-height: 1.4; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .btn { display: block; width: 100%; box-sizing: border-box; padding: 0.85rem; border-radius: 0.5rem; border: 1px solid #475569; font-size: 0.95rem; font-weight: 600; cursor: pointer; color: #e2e8f0; background: transparent; margin-top: 1.25rem; text-align: center; text-decoration: none; }
+    .btn:hover { opacity: 0.92; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+      <span style="font-weight: 700; font-size: 0.9rem; letter-spacing: 0.05em; color: #38bdf8;">PAYGUARD FIREWALL</span>
+      <span class="badge">${escapeHtml(opts.badge)}</span>
+    </div>
+    <h1>${escapeHtml(opts.title)}</h1>
+    <p>${escapeHtml(opts.message)}</p>
+    ${detailsHtml}
+    <a class="btn" href="${escapeHtml(opts.backHref)}">${escapeHtml(opts.backLabel)}</a>
+  </div>
+</body>
+</html>`;
+}
+
 // ============================================================================
 // Mobile Review HTML Page Generator
 // ============================================================================
@@ -155,7 +250,7 @@ function renderApprovalHtml(data: ApprovalReviewData, token: string, csrfToken: 
       <span class="badge badge-hold">HELD FOR REVIEW</span>
     </div>
 
-    <div class="amount">$${escapeHtml(data.amount.amountDecimal)}<span class="currency">${escapeHtml(data.amount.currency)}</span></div>
+    <div class="amount">${escapeHtml(formatCurrencyPrefix(data.amount.currency))}${escapeHtml(data.amount.amountDecimal)}<span class="currency">${escapeHtml(data.amount.currency)}</span></div>
 
     <div class="field">
       <div class="label">Vendor</div>
@@ -228,7 +323,7 @@ function renderApprovalHtml(data: ApprovalReviewData, token: string, csrfToken: 
       <div class="value" style="font-size: 0.85rem; color: #f59e0b;">${escapeHtml(data.expiresAt)}</div>
     </div>
 
-    <form method="POST" action="${escapeHtml(submitPath)}" onsubmit="this.btnSubmit.disabled=true;">
+    <form method="POST" action="${escapeHtml(submitPath)}">
       <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
       <button type="submit" name="btnSubmit" class="btn">${escapeHtml(actionLabel)}</button>
     </form>
@@ -244,6 +339,17 @@ function renderApprovalHtml(data: ApprovalReviewData, token: string, csrfToken: 
 export function createApprovalRouter(options: ApprovalRouterOptions): Router {
   const router = Router();
   const { db, repos, sessionStore } = options;
+  const approvalExecutionService =
+    options.approvalExecutionService ??
+    new ApprovalExecutionService({
+      db,
+      repos,
+      authorizationsService: options.authorizationsService,
+      ordersService: options.ordersService,
+      ...('publicBaseUrl' in options ? { publicBaseUrl: options.publicBaseUrl } : {}),
+      ...('isProduction' in options ? { isProduction: options.isProduction } : {}),
+      logger: options.logger,
+    });
 
   // 1. Enforce strict security headers across all approval routes
   router.use((_req, res, next) => {
@@ -258,17 +364,76 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
     next();
   });
 
-  // 2. Enforce Owner Authentication (session cookie + CSRF on POST)
-  const ownerAuth = createOwnerAuthMiddleware(sessionStore);
+  // 2. Parse HTML form POST bodies (application/x-www-form-urlencoded) before CSRF verification
+  const urlencodedParser = express.urlencoded({ extended: false, limit: '16kb' });
+  router.use((req: Request, res: Response, next: NextFunction) => {
+    urlencodedParser(req, res, (err: unknown) => {
+      if (!err) {
+        next();
+        return;
+      }
+      const errObj = err as { type?: string; status?: number; statusCode?: number };
+      const status =
+        errObj.type === 'entity.too.large' || errObj.status === 413 || errObj.statusCode === 413
+          ? 413
+          : 400;
+      const errorCode = status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INVALID_FORM_BODY';
+      const message =
+        status === 413
+          ? 'Submitted approval form body exceeds maximum allowed size'
+          : 'Malformed approval form submission';
+      if (prefersHtml(req)) {
+        sendHtmlResponse(
+          res,
+          status,
+          renderStatusHtml({
+            badge: status === 413 ? 'Payload Too Large' : 'Bad Request',
+            badgeTone: 'error',
+            title: 'Invalid Submission',
+            message,
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
+      res.status(status).json({ success: false, error: errorCode, message });
+    });
+  });
+
+  // 3. Enforce Owner Authentication (session cookie + CSRF header or form _csrf on POST)
+  const ownerAuth = createOwnerAuthMiddleware(sessionStore, {
+    isProduction: options.isProduction,
+    secureCookie: options.secureCookie,
+    allowFormBodyCsrf: true,
+    htmlErrorResponses: true,
+  });
   router.use(ownerAuth);
 
   // ==========================================================================
   // GET /a/:token — Review Screen / Read-Only Inspection
   // ==========================================================================
   router.get('/:token', async (req: Request, res: Response): Promise<void> => {
+    const wantsHtml = prefersHtml(req);
+
     try {
       const rawToken = typeof req.params.token === 'string' ? req.params.token : '';
       if (!rawToken) {
+        if (wantsHtml) {
+          sendHtmlResponse(
+            res,
+            400,
+            renderStatusHtml({
+              badge: 'Invalid Token',
+              badgeTone: 'error',
+              title: 'Approval Link Invalid',
+              message: 'Token parameter is required.',
+              backHref: '/#/approvals',
+              backLabel: 'Back to Approvals',
+            })
+          );
+          return;
+        }
         res.status(400).json({ success: false, error: 'INVALID_TOKEN_FORMAT', message: 'Token parameter is required' });
         return;
       }
@@ -277,13 +442,7 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
       const verification = verifyApprovalToken(db, repos, { rawToken });
       if (!verification.valid || !verification.approval || !verification.request) {
         if (verification.error === 'HOLD_EXPIRED' && verification.request) {
-          void expirePaymentHold(db, verification.request.id, {
-            repos,
-            authorizationsService: options.authorizationsService,
-            logger: options.logger,
-          }).catch((err: unknown) => {
-            options.logger?.error?.('[Routes] Error during lazy hold expiry on GET /a/:token:', err);
-          });
+          approvalExecutionService.triggerLazyHoldExpiry(verification.request.id);
         }
 
         const statusCode =
@@ -292,6 +451,27 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
             : verification.error === 'TOKEN_ALREADY_USED' || verification.error === 'TOKEN_EXPIRED' || verification.error === 'HOLD_EXPIRED'
             ? 410
             : 400;
+
+        if (wantsHtml) {
+          sendHtmlResponse(
+            res,
+            statusCode,
+            renderStatusHtml({
+              badge: verification.error || 'Error',
+              badgeTone: statusCode === 410 ? 'warn' : 'error',
+              title:
+                statusCode === 410
+                  ? 'Approval Link No Longer Active'
+                  : statusCode === 404
+                  ? 'Approval Link Not Found'
+                  : 'Unable to Load Approval',
+              message: verification.message || 'Approval token could not be verified.',
+              backHref: '/#/approvals',
+              backLabel: 'Open Approvals Dashboard',
+            })
+          );
+          return;
+        }
 
         res.status(statusCode).json({
           success: false,
@@ -373,11 +553,10 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
         channel: approval.channel,
       };
 
-      // Return HTML if specifically requested by a browser navigation, otherwise JSON
-      if (req.accepts('html') && !req.accepts('json')) {
+      // Return HTML when request prefers HTML (including browser Accept headers with */*), otherwise JSON
+      if (wantsHtml) {
         const csrfToken = req.ownerSession?.csrfToken || '';
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.send(renderApprovalHtml(reviewData, rawToken, csrfToken));
+        sendHtmlResponse(res, 200, renderApprovalHtml(reviewData, rawToken, csrfToken));
         return;
       }
 
@@ -386,6 +565,21 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
         review: reviewData,
       });
     } catch {
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          500,
+          renderStatusHtml({
+            badge: 'Error',
+            badgeTone: 'error',
+            title: 'Unexpected Error',
+            message: 'An unexpected error occurred while loading this approval request.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
       res.status(500).json({ success: false, error: 'INTERNAL_ERROR', message: 'An unexpected error occurred' });
     }
   });
@@ -394,145 +588,186 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
   // POST /a/:token/approve — Execute Payment Approval
   // ==========================================================================
   router.post('/:token/approve', async (req: Request, res: Response): Promise<void> => {
+    const wantsHtml = prefersHtml(req);
     const rawToken = typeof req.params.token === 'string' ? req.params.token : '';
     if (!rawToken) {
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          400,
+          renderStatusHtml({
+            badge: 'Invalid Token',
+            badgeTone: 'error',
+            title: 'Approval Failed',
+            message: 'Token parameter is required.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
       res.status(400).json({ success: false, error: 'INVALID_TOKEN_FORMAT', message: 'Token parameter is required' });
       return;
     }
     const ownerSession = req.ownerSession!;
 
-    // Step 1: Atomic SQLite Claim Transaction
-    // Atomically consumes token and transitions HELD -> APPROVED in a single BEGIN IMMEDIATE
-    const claimResult = runInTransaction(db, () => {
-      // 1. Verify token bound to APPROVE
-      const verification = verifyApprovalToken(db, repos, {
-        rawToken,
-        expectedAction: 'APPROVE',
-      });
-
-      if (!verification.valid || !verification.approval || !verification.request) {
-        return {
-          success: false,
-          error: verification.error,
-          message: verification.message,
-          request: verification.request,
-        };
-      }
-
-      const tokenHash = hashApprovalToken(rawToken.trim());
-      const nowIso = new Date().toISOString();
-
-      // 2. Mark token used (CAS)
-      const marked = repos.approvals.markUsed(tokenHash, nowIso);
-      if (!marked) {
-        return {
-          success: false,
-          error: 'TOKEN_ALREADY_USED',
-          message: 'Approval token has already been consumed (concurrent race prevented)',
-        };
-      }
-
-      // 3. Transition payment request HELD -> APPROVED
-      const { request: updatedRequest, auditEntry } = transitionPaymentRequest(db, repos, {
-        requestId: verification.request.id,
-        to: 'APPROVED',
-        actor: 'owner',
-        event: 'OWNER_APPROVED',
-        timestamp: nowIso,
-        payload: {
-          approval_id: verification.approval.id,
-          channel: verification.approval.channel,
-          owner_display_name: ownerSession.displayName,
+    try {
+      const outcome = await approvalExecutionService.execute({
+        action: 'APPROVE',
+        credentials: {
+          channel: 'web',
+          rawToken,
+          ownerId: ownerSession.ownerId,
+          ownerDisplayName: ownerSession.displayName,
         },
       });
 
-      return {
-        success: true,
-        approval: verification.approval,
-        request: updatedRequest,
-        auditEntry,
-      };
-    });
+      if (outcome.action === 'APPROVE') {
+        if (outcome.status === 'CAPTURED') {
+          if (wantsHtml) {
+            sendHtmlResponse(
+              res,
+              200,
+              renderStatusHtml({
+                badge: 'CAPTURED',
+                badgeTone: 'success',
+                title: 'Payment Approved & Captured',
+                message: 'The held payment authorization was approved and captured.',
+                details: [
+                  { label: 'Request ID', value: outcome.requestId },
+                  ...(outcome.captureId ? [{ label: 'Capture ID', value: outcome.captureId }] : []),
+                ],
+                backHref: `/#/requests/${encodeURIComponent(outcome.requestId)}`,
+                backLabel: 'View Payment Request',
+              })
+            );
+            return;
+          }
+          res.status(200).json({
+            success: true,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            executedAction: outcome.executedAction,
+            captureId: outcome.captureId,
+          });
+          return;
+        }
 
-    if (!claimResult.success || !claimResult.request) {
-      if (claimResult.error === 'HOLD_EXPIRED' && claimResult.request) {
-        void expirePaymentHold(db, claimResult.request.id, {
-          repos,
-          authorizationsService: options.authorizationsService,
-          logger: options.logger,
-        }).catch((err: unknown) => {
-          options.logger?.error?.('[Routes] Error during lazy hold expiry on POST /a/:token/approve:', err);
-        });
+        if (outcome.status === 'CAPTURING') {
+          if (wantsHtml) {
+            sendHtmlResponse(
+              res,
+              202,
+              renderStatusHtml({
+                badge: 'CAPTURING',
+                badgeTone: 'warn',
+                title: 'Approval Accepted — Capture Pending',
+                message: outcome.message || 'Capture status is ambiguous and queued for reconciliation.',
+                details: [{ label: 'Request ID', value: outcome.requestId }],
+                backHref: `/#/requests/${encodeURIComponent(outcome.requestId)}`,
+                backLabel: 'View Payment Request',
+              })
+            );
+            return;
+          }
+          res.status(202).json({
+            success: false,
+            status: outcome.status,
+            error: outcome.error,
+            message: outcome.message,
+            requestId: outcome.requestId,
+            reconciliationRequired: outcome.reconciliationRequired,
+          });
+          return;
+        }
+
+        if (outcome.status === 'FAILED') {
+          if (wantsHtml) {
+            sendHtmlResponse(
+              res,
+              500,
+              renderStatusHtml({
+                badge: 'FAILED',
+                badgeTone: 'error',
+                title: 'Payment Capture Failed',
+                message: outcome.message || 'Payment capture could not be completed.',
+                details: [{ label: 'Request ID', value: outcome.requestId }],
+                backHref: `/#/requests/${encodeURIComponent(outcome.requestId)}`,
+                backLabel: 'View Payment Request',
+              })
+            );
+            return;
+          }
+          res.status(500).json({
+            success: false,
+            status: outcome.status,
+            error: outcome.error,
+            message: outcome.message,
+          });
+          return;
+        }
       }
 
-      const statusCode =
-        claimResult.error === 'TOKEN_ALREADY_USED'
-          ? 409
-          : claimResult.error === 'TOKEN_EXPIRED' || claimResult.error === 'HOLD_EXPIRED'
-          ? 410
-          : 400;
-
-      res.status(statusCode).json({
-        success: false,
-        error: claimResult.error,
-        message: claimResult.message,
-      });
-      return;
-    }
-
-    // Step 2: Route money-moving capture exclusively through executeDecision() in src/core
-    try {
-      const execution = await executeDecision(
-        { requestId: claimResult.request.id },
-        {
-          db,
-          repos,
-          actor: 'owner',
-          authorizationsService: options.authorizationsService,
-          ordersService: options.ordersService,
-        }
-      );
-
-      if (execution.status === 'FAILED') {
-        res.status(500).json({
-          success: false,
-          status: 'FAILED',
-          error: execution.error || 'EXECUTION_FAILED',
-          message: 'Payment execution failed at PayPal and request has been marked FAILED',
-        });
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          500,
+          renderStatusHtml({
+            badge: 'INTERNAL_ERROR',
+            badgeTone: 'error',
+            title: 'Unexpected Execution State',
+            message: 'Unexpected execution state encountered during payment approval.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
         return;
       }
-
-      res.status(200).json({
-        success: true,
-        requestId: execution.request.id,
-        status: execution.status,
-        executedAction: execution.executedAction,
-        captureId: execution.captureId,
+      res.status(500).json({
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: 'Unexpected execution state',
       });
     } catch (err: unknown) {
-      if (err instanceof AmbiguousExecutionError) {
-        res.status(202).json({
+      if (err instanceof ApprovalValidationError) {
+        if (wantsHtml) {
+          sendHtmlResponse(
+            res,
+            err.statusCode,
+            renderStatusHtml({
+              badge: err.code,
+              badgeTone: err.statusCode === 410 || err.statusCode === 409 ? 'warn' : 'error',
+              title: 'Approval Could Not Be Completed',
+              message: err.message,
+              backHref: '/#/approvals',
+              backLabel: 'Open Approvals Dashboard',
+            })
+          );
+          return;
+        }
+        res.status(err.statusCode).json({
           success: false,
-          status: 'CAPTURING',
-          error: 'AMBIGUOUS_EXECUTION',
-          message: err.message,
-          requestId: err.requestId,
-          reconciliationRequired: true,
-        });
-        return;
-      }
-
-      if (err instanceof ExecuteDecisionError) {
-        res.status(500).json({
-          success: false,
-          status: 'FAILED',
           error: err.code,
           message: err.message,
         });
         return;
       }
 
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          500,
+          renderStatusHtml({
+            badge: 'EXECUTION_ERROR',
+            badgeTone: 'error',
+            title: 'Payment Approval Error',
+            message: 'An error occurred during payment capture execution.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
       res.status(500).json({
         success: false,
         error: 'EXECUTION_ERROR',
@@ -545,193 +780,173 @@ export function createApprovalRouter(options: ApprovalRouterOptions): Router {
   // POST /a/:token/void — Execute Payment Void
   // ==========================================================================
   router.post('/:token/void', async (req: Request, res: Response): Promise<void> => {
+    const wantsHtml = prefersHtml(req);
     const rawToken = typeof req.params.token === 'string' ? req.params.token : '';
     if (!rawToken) {
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          400,
+          renderStatusHtml({
+            badge: 'Invalid Token',
+            badgeTone: 'error',
+            title: 'Void Failed',
+            message: 'Token parameter is required.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
       res.status(400).json({ success: false, error: 'INVALID_TOKEN_FORMAT', message: 'Token parameter is required' });
       return;
     }
     const ownerSession = req.ownerSession!;
 
-    // Step 1: Atomic SQLite Void Transaction
-    // Atomically consumes token, inserts RELEASE ledger row, and transitions HELD -> VOIDED
-    const claimResult = runInTransaction(db, () => {
-      // 1. Verify token bound to VOID
-      const verification = verifyApprovalToken(db, repos, {
-        rawToken,
-        expectedAction: 'VOID',
-      });
-
-      if (!verification.valid || !verification.approval || !verification.request) {
-        return {
-          success: false,
-          error: verification.error,
-          message: verification.message,
-          request: verification.request,
-        };
-      }
-
-      const tokenHash = hashApprovalToken(rawToken.trim());
-      const nowIso = new Date().toISOString();
-
-      // 2. Mark token used (CAS)
-      const marked = repos.approvals.markUsed(tokenHash, nowIso);
-      if (!marked) {
-        return {
-          success: false,
-          error: 'TOKEN_ALREADY_USED',
-          message: 'Approval token has already been consumed (concurrent race prevented)',
-        };
-      }
-
-      // 3. Insert RELEASE row in ledger (releasing budget reservation)
-      const ledgerId = `led-${crypto.randomUUID()}`;
-      repos.ledger.insert({
-        id: ledgerId,
-        request_id: verification.request.id,
-        kind: 'RELEASE',
-        amount_minor: verification.request.amount_minor,
-        currency: verification.request.currency,
-        created_at: nowIso,
-      });
-
-      // 4. Transition payment request HELD -> VOIDED
-      const authId = verification.request.paypal_authorization_id;
-      const initialVoidStatus = authId ? 'PENDING' : 'FAILED';
-
-      const { request: updatedRequest, auditEntry } = transitionPaymentRequest(db, repos, {
-        requestId: verification.request.id,
-        to: 'VOIDED',
-        actor: 'owner',
-        event: 'TRANSITION_TO_VOIDED',
-        timestamp: nowIso,
-        payload: {
-          approval_id: verification.approval.id,
-          channel: verification.approval.channel,
-          owner_display_name: ownerSession.displayName,
-          reason: 'Owner rejected and voided payment hold',
-          remote_void_status: initialVoidStatus,
+    try {
+      const outcome = await approvalExecutionService.execute({
+        action: 'VOID',
+        credentials: {
+          channel: 'web',
+          rawToken,
+          ownerId: ownerSession.ownerId,
+          ownerDisplayName: ownerSession.displayName,
         },
       });
 
-      repos.paymentRequests.updateRemoteVoidStatus(verification.request.id, initialVoidStatus, nowIso);
+      if (outcome.action === 'VOID') {
+        if (outcome.remoteVoidSuccess) {
+          if (wantsHtml) {
+            sendHtmlResponse(
+              res,
+              200,
+              renderStatusHtml({
+                badge: 'VOIDED',
+                badgeTone: 'success',
+                title: 'Payment Hold Voided',
+                message: 'The authorization hold was voided and reserved budget was released.',
+                details: [
+                  { label: 'Request ID', value: outcome.requestId },
+                  { label: 'Remote Void Status', value: outcome.remoteVoidStatus },
+                ],
+                backHref: `/#/requests/${encodeURIComponent(outcome.requestId)}`,
+                backLabel: 'View Payment Request',
+              })
+            );
+            return;
+          }
+          res.status(200).json({
+            success: true,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            remoteVoidStatus: outcome.remoteVoidStatus,
+            remoteVoidSuccess: true,
+          });
+          return;
+        }
 
-      return {
-        success: true,
-        approval: verification.approval,
-        request: updatedRequest,
-        auditEntry,
-      };
-    });
-
-    if (!claimResult.success || !claimResult.request) {
-      if (claimResult.error === 'HOLD_EXPIRED' && claimResult.request) {
-        void expirePaymentHold(db, claimResult.request.id, {
-          repos,
-          authorizationsService: options.authorizationsService,
-          logger: options.logger,
-        }).catch((err: unknown) => {
-          options.logger?.error?.('[Routes] Error during lazy hold expiry on POST /a/:token/void:', err);
+        if (wantsHtml) {
+          sendHtmlResponse(
+            res,
+            202,
+            renderStatusHtml({
+              badge: 'VOIDED (RECONCILIATION QUEUED)',
+              badgeTone: 'warn',
+              title: 'Local Hold Voided — Remote Void Pending',
+              message:
+                outcome.message ||
+                'Reserved funds were released locally; remote PayPal authorization void requires background reconciliation.',
+              details: [
+                { label: 'Request ID', value: outcome.requestId },
+                { label: 'Remote Void Status', value: outcome.remoteVoidStatus },
+              ],
+              backHref: `/#/requests/${encodeURIComponent(outcome.requestId)}`,
+              backLabel: 'View Payment Request',
+            })
+          );
+          return;
+        }
+        res.status(202).json({
+          success: true,
+          requestId: outcome.requestId,
+          status: outcome.status,
+          remoteVoidStatus: outcome.remoteVoidStatus,
+          remoteVoidSuccess: false,
+          reconciliationRequired: true,
+          message: outcome.message,
         });
+        return;
       }
 
-      const statusCode =
-        claimResult.error === 'TOKEN_ALREADY_USED'
-          ? 409
-          : claimResult.error === 'TOKEN_EXPIRED' || claimResult.error === 'HOLD_EXPIRED'
-          ? 410
-          : 400;
-
-      res.status(statusCode).json({
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          500,
+          renderStatusHtml({
+            badge: 'INTERNAL_ERROR',
+            badgeTone: 'error',
+            title: 'Unexpected Execution State',
+            message: 'Unexpected execution state encountered during payment void.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
+      res.status(500).json({
         success: false,
-        error: claimResult.error,
-        message: claimResult.message,
+        error: 'INTERNAL_ERROR',
+        message: 'Unexpected execution state',
       });
-      return;
-    }
-
-    // Step 2: Void remote PayPal authorization outside database transaction
-    const authId = claimResult.request.paypal_authorization_id;
-
-    if (!authId) {
-      writeAuditLogEntry(db, repos, {
-        actor: 'system',
-        event: 'PAYPAL_VOID_UNRESOLVED_NO_AUTH_ID',
-        requestId: claimResult.request.id,
-        payload: {
-          reason: 'Cannot cancel remote authorization: request is missing paypal_authorization_id',
-          remote_void_status: 'FAILED',
-        },
-      });
-
-      res.status(202).json({
-        success: true,
-        requestId: claimResult.request.id,
-        status: 'VOIDED',
-        remoteVoidStatus: 'FAILED',
-        remoteVoidSuccess: false,
-        reconciliationRequired: true,
-        message: 'Local void committed, but remote cancellation failed: missing paypal_authorization_id',
-      });
-      return;
-    }
-
-    let remoteVoidSuccess = false;
-
-    if (options.authorizationsService) {
-      try {
-        const voidRes = await options.authorizationsService.voidAuthorization({
-          authorizationId: authId,
-          requestId: claimResult.request.id,
+    } catch (err: unknown) {
+      if (err instanceof ApprovalValidationError) {
+        if (wantsHtml) {
+          sendHtmlResponse(
+            res,
+            err.statusCode,
+            renderStatusHtml({
+              badge: err.code,
+              badgeTone: err.statusCode === 410 || err.statusCode === 409 ? 'warn' : 'error',
+              title: 'Void Could Not Be Completed',
+              message: err.message,
+              backHref: '/#/approvals',
+              backLabel: 'Open Approvals Dashboard',
+            })
+          );
+          return;
+        }
+        res.status(err.statusCode).json({
+          success: false,
+          error: err.code,
+          message: err.message,
         });
-        remoteVoidSuccess = voidRes.isVoided;
-      } catch (err: unknown) {
-        // Audit remote void failure; local state is safely VOIDED and reservation released
-        writeAuditLogEntry(db, repos, {
-          actor: 'system',
-          event: 'PAYPAL_VOID_PENDING_RETRY',
-          requestId: claimResult.request.id,
-          payload: {
-            error: err instanceof Error ? err.message : String(err),
-            authorizationId: authId,
-            remote_void_status: 'PENDING',
-          },
-        });
+        return;
       }
-    }
 
-    if (remoteVoidSuccess) {
-      repos.paymentRequests.updateRemoteVoidStatus(claimResult.request.id, 'CONFIRMED');
-      writeAuditLogEntry(db, repos, {
-        actor: 'system',
-        event: 'PAYPAL_VOID_CONFIRMED',
-        requestId: claimResult.request.id,
-        payload: {
-          authorizationId: authId,
-          remote_void_status: 'CONFIRMED',
-        },
+      if (wantsHtml) {
+        sendHtmlResponse(
+          res,
+          500,
+          renderStatusHtml({
+            badge: 'INTERNAL_ERROR',
+            badgeTone: 'error',
+            title: 'Payment Void Error',
+            message: 'An error occurred during payment void execution.',
+            backHref: '/#/approvals',
+            backLabel: 'Back to Approvals',
+          })
+        );
+        return;
+      }
+      res.status(500).json({
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: 'An error occurred during payment void execution',
       });
-
-      res.status(200).json({
-        success: true,
-        requestId: claimResult.request.id,
-        status: 'VOIDED',
-        remoteVoidStatus: 'CONFIRMED',
-        remoteVoidSuccess: true,
-      });
-      return;
     }
-
-    // Remote void unconfirmed / pending retry: return HTTP 202
-    res.status(202).json({
-      success: true,
-      requestId: claimResult.request.id,
-      status: 'VOIDED',
-      remoteVoidStatus: 'PENDING',
-      remoteVoidSuccess: false,
-      reconciliationRequired: true,
-      message: 'Local void committed; remote PayPal cancellation is pending retry',
-    });
   });
 
   return router;
 }
+
+export { createApprovalRouter as createApprovalsRouter };

@@ -320,4 +320,151 @@ export const MIGRATIONS: readonly Migration[] = [
       END;
     `,
   },
+  {
+    version: 7,
+    name: '007_telegram_link_tokens',
+    up: `
+      -- 1. Ephemeral linking tokens for secure owner-Telegram binding
+      CREATE TABLE IF NOT EXISTS telegram_link_tokens (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_telegram_link_tokens_hash
+        ON telegram_link_tokens(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_telegram_link_tokens_owner_expires
+        ON telegram_link_tokens(owner_id, expires_at);
+
+      -- 2. Metadata columns on owners table
+      ALTER TABLE owners ADD COLUMN telegram_username TEXT;
+      ALTER TABLE owners ADD COLUMN telegram_linked_at TEXT;
+    `,
+  },
+  {
+    version: 8,
+    name: '008_telegram_chat_id_unique',
+    up: `
+      -- Partial unique index ensuring each non-null telegram_chat_id can belong to at most one owner
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_owners_telegram_chat_id
+        ON owners(telegram_chat_id)
+        WHERE telegram_chat_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 9,
+    name: '009_notification_outbox',
+    up: `
+      -- 1. Transactional notification outbox for Telegram alerts
+      CREATE TABLE IF NOT EXISTS notification_outbox (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        recipient_chat_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        linked_at TEXT NOT NULL,
+        request_id TEXT REFERENCES payment_requests(id) ON DELETE SET NULL,
+        dedup_key TEXT UNIQUE NOT NULL,
+        message_text TEXT NOT NULL,
+        parse_mode TEXT NOT NULL DEFAULT 'HTML' CHECK (parse_mode IN ('HTML', 'None')),
+        status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PROCESSING', 'SENT', 'FAILED', 'DEAD', 'CANCELLED')),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        next_attempt_at TEXT NOT NULL,
+        claimed_at TEXT,
+        claim_id TEXT,
+        last_error TEXT,
+        telegram_message_id INTEGER,
+        created_at TEXT NOT NULL,
+        sent_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
+        ON notification_outbox(next_attempt_at, created_at)
+        WHERE status = 'PENDING';
+
+      CREATE INDEX IF NOT EXISTS idx_notification_outbox_processing
+        ON notification_outbox(claimed_at)
+        WHERE status = 'PROCESSING';
+
+      CREATE INDEX IF NOT EXISTS idx_notification_outbox_request
+        ON notification_outbox(request_id);
+
+      CREATE INDEX IF NOT EXISTS idx_notification_outbox_owner
+        ON notification_outbox(owner_id);
+    `,
+  },
+  {
+    version: 10,
+    name: '010_telegram_approval_callbacks',
+    up: `
+      -- 1. Extend owners table with immutable numeric Telegram user ID
+      ALTER TABLE owners ADD COLUMN telegram_user_id TEXT;
+
+      -- 2. Extend notification_outbox table with encrypted inline keyboard markup
+      ALTER TABLE notification_outbox ADD COLUMN reply_markup_enc TEXT;
+
+      -- 3. Create hash-only callback storage table
+      CREATE TABLE IF NOT EXISTS telegram_approval_callbacks (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+        owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        action TEXT NOT NULL CHECK (action IN ('APPROVE', 'VOID')),
+        telegram_chat_id TEXT NOT NULL,
+        telegram_user_id TEXT NOT NULL,
+        snapshot_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_telegram_approval_callbacks_hash
+        ON telegram_approval_callbacks(token_hash);
+
+      CREATE INDEX IF NOT EXISTS idx_telegram_approval_callbacks_request
+        ON telegram_approval_callbacks(request_id);
+
+      CREATE INDEX IF NOT EXISTS idx_telegram_approval_callbacks_owner
+        ON telegram_approval_callbacks(owner_id);
+
+      CREATE INDEX IF NOT EXISTS idx_telegram_approval_callbacks_expires
+        ON telegram_approval_callbacks(expires_at)
+        WHERE used_at IS NULL;
+    `,
+  },
+  {
+    version: 11,
+    name: '011_telegram_callbacks_linked_at',
+    up: `
+      -- 1. Extend telegram_approval_callbacks with link epoch binding
+      ALTER TABLE telegram_approval_callbacks ADD COLUMN linked_at TEXT;
+    `,
+  },
+  {
+    version: 12,
+    name: '012_owner_sessions',
+    up: `
+      -- 1. Persistent server-side owner sessions (stores SHA-256 session_key digests only)
+      CREATE TABLE IF NOT EXISTS owner_sessions (
+        session_key TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+        display_name TEXT NOT NULL,
+        csrf_token TEXT NOT NULL,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= 0)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner_id
+        ON owner_sessions(owner_id);
+
+      CREATE INDEX IF NOT EXISTS idx_owner_sessions_last_accessed
+        ON owner_sessions(last_accessed_at);
+
+      CREATE INDEX IF NOT EXISTS idx_owner_sessions_created_at
+        ON owner_sessions(created_at);
+    `,
+  },
 ];

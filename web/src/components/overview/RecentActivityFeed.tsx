@@ -19,30 +19,61 @@ export function RecentActivityFeed({
   const hasItems = recentActivity.length > 0;
 
   const getStatusIcon = (status: string, decision: string) => {
-    if (status === 'CAPTURED' || decision === 'ALLOW') {
+    const normStatus = (status || '').toUpperCase();
+    const normDecision = (decision || '').toUpperCase();
+
+    if (normStatus === 'CAPTURED') {
       return (
-        <div className="w-8 h-8 rounded-full bg-[#B8D99A]/10 border border-[#B8D99A]/20 flex items-center justify-center flex-shrink-0">
-          <CheckCircle2 className="w-4 h-4 text-[#B8D99A]" />
+        <div className="w-8 h-8 rounded-full bg-[var(--accent-sage)]/10 border border-[var(--accent-sage)]/25 flex items-center justify-center flex-shrink-0">
+          <CheckCircle2 className="w-4 h-4 text-[var(--accent-sage)]" />
         </div>
       );
     }
-    if (status === 'HELD' || decision === 'HOLD') {
+    if (normStatus === 'AUTO_EXECUTING' || normStatus === 'APPROVED' || normStatus === 'CAPTURING') {
       return (
-        <div className="w-8 h-8 rounded-full bg-[#BBA9D8]/10 border border-[#BBA9D8]/20 flex items-center justify-center flex-shrink-0">
-          <Clock className="w-4 h-4 text-[#BBA9D8]" />
+        <div className="w-8 h-8 rounded-full bg-[var(--accent-lavender)]/10 border border-[var(--accent-lavender)]/25 flex items-center justify-center flex-shrink-0">
+          <Clock className="w-4 h-4 text-[var(--accent-lavender)]" />
         </div>
       );
     }
-    if (status === 'DENIED' || decision === 'DENY') {
+    if (normStatus === 'HELD') {
       return (
-        <div className="w-8 h-8 rounded-full bg-[#E89A9A]/10 border border-[#E89A9A]/20 flex items-center justify-center flex-shrink-0">
-          <ShieldAlert className="w-4 h-4 text-[#E89A9A]" />
+        <div className="w-8 h-8 rounded-full bg-[var(--accent-peach)]/10 border border-[var(--accent-peach)]/25 flex items-center justify-center flex-shrink-0">
+          <Clock className="w-4 h-4 text-[var(--accent-peach)]" />
+        </div>
+      );
+    }
+    if (normStatus === 'DENIED' || normStatus === 'FAILED' || normDecision === 'DENY') {
+      return (
+        <div className="w-8 h-8 rounded-full bg-[var(--status-error-bg)] border border-[var(--status-error-border)] flex items-center justify-center flex-shrink-0">
+          <ShieldAlert className="w-4 h-4 text-[var(--status-error)]" />
+        </div>
+      );
+    }
+    if (normStatus === 'EXPIRED' || normStatus === 'VOIDED') {
+      return (
+        <div className="w-8 h-8 rounded-full bg-[var(--elevated-bg)] border border-[var(--border-color)] flex items-center justify-center flex-shrink-0">
+          <XCircle className="w-4 h-4 text-[var(--text-secondary)]" />
+        </div>
+      );
+    }
+    if (normDecision === 'ALLOW') {
+      return (
+        <div className="w-8 h-8 rounded-full bg-[var(--accent-sage)]/10 border border-[var(--accent-sage)]/25 flex items-center justify-center flex-shrink-0">
+          <CheckCircle2 className="w-4 h-4 text-[var(--accent-sage)]" />
+        </div>
+      );
+    }
+    if (normDecision === 'HOLD') {
+      return (
+        <div className="w-8 h-8 rounded-full bg-[var(--accent-peach)]/10 border border-[var(--accent-peach)]/25 flex items-center justify-center flex-shrink-0">
+          <Clock className="w-4 h-4 text-[var(--accent-peach)]" />
         </div>
       );
     }
     return (
-      <div className="w-8 h-8 rounded-full bg-[#171717] border border-[#262626] flex items-center justify-center flex-shrink-0">
-        <XCircle className="w-4 h-4 text-[#A0A0A0]" />
+      <div className="w-8 h-8 rounded-full bg-[var(--elevated-bg)] border border-[var(--border-color)] flex items-center justify-center flex-shrink-0">
+        <XCircle className="w-4 h-4 text-[var(--text-secondary)]" />
       </div>
     );
   };
@@ -74,6 +105,15 @@ export function RecentActivityFeed({
         {hasItems ? (
           recentActivity.map((r) => {
             const primaryReason = r.reasons && r.reasons.length > 0 ? r.reasons[0] : null;
+            const hasUnresolvedVoid =
+              r.remoteVoidStatus === 'PENDING' || r.remoteVoidStatus === 'FAILED';
+            const paypalRef = r.paypalCaptureId
+              ? { label: `Cap ${r.paypalCaptureId.slice(-8)}`, full: r.paypalCaptureId }
+              : r.paypalAuthorizationId
+              ? { label: `Auth ${r.paypalAuthorizationId.slice(-8)}`, full: r.paypalAuthorizationId }
+              : r.paypalOrderId
+              ? { label: `Ord ${r.paypalOrderId.slice(-8)}`, full: r.paypalOrderId }
+              : null;
 
             const handleItemClick = () => {
               if (onSelectRequest) {
@@ -115,7 +155,27 @@ export function RecentActivityFeed({
                   <span className="font-sans text-sm font-semibold text-[var(--text-primary)]">
                     {formatUsdFromMinor(r.amountMinor)}
                   </span>
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                    {paypalRef && (
+                      <span
+                        className="hidden sm:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded bg-[var(--elevated-bg)] text-[var(--text-secondary)] border border-[var(--border-color)] max-w-[110px] truncate"
+                        title={`PayPal ID: ${paypalRef.full}`}
+                      >
+                        {paypalRef.label}
+                      </span>
+                    )}
+                    {hasUnresolvedVoid && (
+                      <span
+                        className={`text-[10px] font-mono px-1.5 py-0.5 rounded border uppercase ${
+                          r.remoteVoidStatus === 'FAILED'
+                            ? 'bg-[var(--status-error-bg)] text-[var(--status-error)] border-[var(--status-error-border)]'
+                            : 'bg-[var(--status-warn-bg)] text-[var(--status-warn)] border-[var(--status-warn-border)]'
+                        }`}
+                        title={`Remote void status: ${r.remoteVoidStatus}`}
+                      >
+                        Void {r.remoteVoidStatus}
+                      </span>
+                    )}
                     {primaryReason && (
                       <span
                         className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[var(--elevated-bg)] text-[var(--text-secondary)] border border-[var(--border-color)] max-w-[110px] truncate"

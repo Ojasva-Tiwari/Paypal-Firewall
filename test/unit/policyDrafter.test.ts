@@ -32,7 +32,7 @@
  * 18. Input boundary validation (empty prompt, excessive length, invalid active policy).
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   PolicyDrafter,
   PolicyDrafterError,
@@ -40,6 +40,7 @@ import {
   computeProposalHash,
   canonicalizeProposal,
 } from '../../src/ai/policyDrafter.js';
+import { resetConfig } from '../../src/config/index.js';
 import { InjectionDetector } from '../../src/ai/injectionDetector.js';
 import { MockAiProvider } from '../../src/ai/mockProvider.js';
 import { AiService } from '../../src/ai/service.js';
@@ -93,7 +94,11 @@ describe('M5-T6: Plain-English Policy Authoring — AI Policy Drafting Engine', 
     }),
   } as unknown as InjectionDetector;
 
+  let originalMaxHardCapEnv: string | undefined;
+
   beforeEach(() => {
+    originalMaxHardCapEnv = process.env.MAX_HARD_CAP_MINOR;
+    resetConfig();
     db = createDatabase(':memory:');
     runMigrations(db);
     repos = createRepositories(db);
@@ -105,6 +110,15 @@ describe('M5-T6: Plain-English Policy Authoring — AI Policy Drafting Engine', 
     });
     injectionDetector = new InjectionDetector(aiService);
     drafter = new PolicyDrafter(aiService, injectionDetector);
+  });
+
+  afterEach(() => {
+    if (originalMaxHardCapEnv === undefined) {
+      delete process.env.MAX_HARD_CAP_MINOR;
+    } else {
+      process.env.MAX_HARD_CAP_MINOR = originalMaxHardCapEnv;
+    }
+    resetConfig();
   });
 
   // --------------------------------------------------------------------------
@@ -984,5 +998,130 @@ describe('M5-T6: Plain-English Policy Authoring — AI Policy Drafting Engine', 
         activePolicy: corruptedActive,
       })
     ).rejects.toThrowError('Active policy document failed canonical schema validation');
+  });
+
+  // --------------------------------------------------------------------------
+  // 19. MAX_HARD_CAP_MINOR Ceiling Enforcement
+  // --------------------------------------------------------------------------
+  describe('19. MAX_HARD_CAP_MINOR Ceiling Enforcement', () => {
+    it('allows hard_cap_minor exactly equal to configured MAX_HARD_CAP_MINOR and rejects +1', async () => {
+      mockProvider.customStructuredResponse = () => ({
+        proposed_rules: {
+          hard_cap_minor: 25000,
+        },
+        explanation: 'Set hard cap to $250.',
+        unsupported_requests: [],
+      });
+
+      const boundedDrafter = new PolicyDrafter(aiService, clearDetector, {
+        maxHardCapMinor: toMinorUnits(25000),
+      });
+
+      const okResult = await boundedDrafter.draftPolicy({
+        prompt: 'Set hard cap to $250.',
+        activePolicy: BASE_POLICY_V1,
+      });
+      expect(okResult.proposedRules.hard_cap_minor).toBe(25000);
+
+      // +1 above configured option ceiling fails closed
+      mockProvider.customStructuredResponse = () => ({
+        proposed_rules: {
+          hard_cap_minor: 25001,
+        },
+        explanation: 'Set hard cap to $250.01.',
+        unsupported_requests: [],
+      });
+
+      await expect(
+        boundedDrafter.draftPolicy({
+          prompt: 'Set hard cap to $250.01.',
+          activePolicy: BASE_POLICY_V1,
+        })
+      ).rejects.toMatchObject({
+        code: 'RULE_CONSTRAINT_VIOLATION',
+      });
+
+      // Override via input.maxHardCapMinor also rejects +1
+      mockProvider.customStructuredResponse = () => ({
+        proposed_rules: {
+          hard_cap_minor: 15001,
+        },
+        explanation: 'Set hard cap to $150.01.',
+        unsupported_requests: [],
+      });
+
+      const inputBoundedDrafter = new PolicyDrafter(aiService, clearDetector);
+      await expect(
+        inputBoundedDrafter.draftPolicy({
+          prompt: 'Set hard cap to $150.01.',
+          activePolicy: BASE_POLICY_V1,
+          maxHardCapMinor: toMinorUnits(15000),
+        })
+      ).rejects.toMatchObject({
+        code: 'RULE_CONSTRAINT_VIOLATION',
+      });
+    });
+
+    it('enforces MAX_HARD_CAP_MINOR from config environment and blocks inherited excess hard caps', async () => {
+      process.env.MAX_HARD_CAP_MINOR = '20000';
+      resetConfig();
+
+      // Active policy exceeds newly lowered 20000 ceiling; AI only changes auto_limit_minor -> inherited hard_cap_minor 30000 > 20000 -> rejected
+      const elevatedActivePolicy: PolicyDocument = {
+        ...BASE_POLICY_V1,
+        hard_cap_minor: toMinorUnits(30000),
+      };
+
+      mockProvider.customStructuredResponse = () => ({
+        proposed_rules: {
+          auto_limit_minor: 1000,
+        },
+        explanation: 'Lower auto limit to $10.',
+        unsupported_requests: [],
+      });
+
+      const envDrafter = new PolicyDrafter(aiService, clearDetector);
+      await expect(
+        envDrafter.draftPolicy({
+          prompt: 'Lower auto limit to $10.',
+          activePolicy: elevatedActivePolicy,
+        })
+      ).rejects.toMatchObject({
+        code: 'RULE_CONSTRAINT_VIOLATION',
+      });
+
+      // Succeeds if proposal lowers hard_cap_minor back within ceiling (20000)
+      mockProvider.customStructuredResponse = () => ({
+        proposed_rules: {
+          auto_limit_minor: 1000,
+          hard_cap_minor: 20000,
+        },
+        explanation: 'Lower auto limit to $10 and hard cap to $200.',
+        unsupported_requests: [],
+      });
+
+      const okResult = await envDrafter.draftPolicy({
+        prompt: 'Lower auto limit to $10 and hard cap to $200.',
+        activePolicy: elevatedActivePolicy,
+      });
+      expect(okResult.proposedRules.hard_cap_minor).toBe(20000);
+    });
+
+    it('fails closed before invoking AI if configured maxHardCapMinor ceiling is invalid', async () => {
+      const generateSpy = vi.spyOn(aiService, 'generateStructured');
+      const invalidDrafter = new PolicyDrafter(aiService, clearDetector, {
+        maxHardCapMinor: 0 as never,
+      });
+
+      await expect(
+        invalidDrafter.draftPolicy({
+          prompt: 'Lower auto limit to $10.',
+          activePolicy: BASE_POLICY_V1,
+        })
+      ).rejects.toMatchObject({
+        code: 'RULE_CONSTRAINT_VIOLATION',
+      });
+      expect(generateSpy).not.toHaveBeenCalled();
+    });
   });
 });

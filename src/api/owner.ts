@@ -44,24 +44,30 @@ import {
   type MinorUnits,
   MAX_MINOR_UNITS,
 } from '../core/money.js';
+import { writeAuditLogEntry } from '../core/stateMachine.js';
 import {
-  transitionPaymentRequest,
-  writeAuditLogEntry,
-} from '../core/stateMachine.js';
-import { executeDecision } from '../core/executeDecision.js';
-import { expirePaymentHold } from '../approvals/expiry.js';
+  ApprovalExecutionService,
+  ApprovalValidationError,
+} from '../approvals/service.js';
 import { getRollingBudgets } from '../core/facts.js';
-import { PolicyDocumentSchema, type Decision } from '../policy/types.js';
+import { PolicyDocumentSchema, type Decision, type PolicyDocument } from '../policy/types.js';
+
+class PolicyValidationError extends Error {
+  constructor(message: string, public readonly details: unknown) {
+    super(message);
+    this.name = 'PolicyValidationError';
+  }
+}
 import {
   explainPolicyDecision,
   type PolicyExplanationContext,
 } from '../policy/explanations.js';
 import { generateAgentKey } from '../mcp/auth.js';
-import { AuthorizationError } from '../paypal/authorizations.js';
 import type { AgentRow, VendorRow, PolicyVersionRow, PolicyProposalRow, ProposalStatus } from '../db/types.js';
 import type { AiService } from '../ai/service.js';
 import { RiskExplainer, type AiRiskExplanationResponse } from '../ai/riskExplainer.js';
 import { PolicyDrafter, PolicyDrafterError, computeProposalHash } from '../ai/policyDrafter.js';
+import { getConfig, validateHardCapWithinCeiling } from '../config/index.js';
 
 // ============================================================================
 // Types & Options
@@ -71,9 +77,14 @@ export interface OwnerApiRouterOptions {
   readonly db: Database;
   readonly repos: Repositories;
   readonly sessionStore: OwnerSessionStore;
+  readonly isProduction?: boolean;
+  readonly publicBaseUrl?: string;
+  readonly secureCookie?: boolean;
+  readonly maxHardCapMinor?: MinorUnits;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly ordersService?: PayPalOrdersService;
   readonly aiService?: AiService;
+  readonly approvalExecutionService?: ApprovalExecutionService;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -109,6 +120,19 @@ const ALLOWED_ACTORS: ReadonlySet<string> = new Set<string>([
 export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
   const router = Router();
   const { db, repos, sessionStore, authorizationsService, ordersService, aiService, logger } = options;
+  const resolveMaxHardCapMinor = (): MinorUnits =>
+    options.maxHardCapMinor ?? getConfig().maxHardCapMinor;
+  const approvalExecutionService =
+    options.approvalExecutionService ??
+    new ApprovalExecutionService({
+      db,
+      repos,
+      authorizationsService,
+      ordersService,
+      ...('publicBaseUrl' in options ? { publicBaseUrl: options.publicBaseUrl } : {}),
+      ...('isProduction' in options ? { isProduction: options.isProduction } : {}),
+      logger,
+    });
 
   // --------------------------------------------------------------------------
   // Public Health Endpoint (/api/healthz)
@@ -126,7 +150,10 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
   // All subsequent routes require a valid owner session.
   // State-changing requests (POST) require a valid x-csrf-token header.
   // --------------------------------------------------------------------------
-  const ownerAuthMiddleware = createOwnerAuthMiddleware(sessionStore);
+  const ownerAuthMiddleware = createOwnerAuthMiddleware(sessionStore, {
+    isProduction: options.isProduction,
+    secureCookie: options.secureCookie,
+  });
   router.use(ownerAuthMiddleware);
 
   // ==========================================================================
@@ -192,6 +219,10 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
           currency: r.currency,
           agentId: r.agent_id,
           agentName: agent?.name ?? r.agent_id,
+          paypalOrderId: r.paypal_order_id,
+          paypalAuthorizationId: r.paypal_authorization_id,
+          paypalCaptureId: r.paypal_capture_id,
+          remoteVoidStatus: r.remote_void_status ?? null,
         };
       });
 
@@ -269,7 +300,12 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
           status: r.status,
           decision: r.decision,
           reasons,
+          paypalOrderId: r.paypal_order_id,
+          paypalAuthorizationId: r.paypal_authorization_id,
+          paypalCaptureId: r.paypal_capture_id,
+          remoteVoidStatus: r.remote_void_status ?? null,
           createdAt: r.created_at,
+          updatedAt: r.updated_at,
           expiresAt: r.expires_at,
         };
       });
@@ -305,11 +341,7 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         request.expires_at &&
         new Date(request.expires_at).getTime() <= Date.now()
       ) {
-        await expirePaymentHold(db, requestId, {
-          repos,
-          authorizationsService,
-          logger,
-        });
+        await approvalExecutionService.expireHoldTracked(requestId);
         request = repos.paymentRequests.getById(requestId)!;
       }
 
@@ -364,30 +396,72 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
       // Build deterministic policy explanation context (M5-T2)
       let autoLimitMinor: number | undefined;
       let hardCapMinor: number | undefined;
+      let agentBudgetMinor: number | undefined;
       let globalBudgetMinor: number | undefined;
+      let velocityWindowMinutes: number | undefined;
+      let velocityMaxRequests: number | undefined;
+      let duplicateWindowMinutes: number | undefined;
       let newVendorAction: 'HOLD' | 'DENY' | undefined;
       let allowedCurrencies: string[] | undefined;
       let vendorCategories: string[] | undefined;
 
-      if (vendor) {
+      const readNonNegativeInt = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) && value >= 0
+          ? Math.floor(value)
+          : undefined;
+      const readPositiveInt = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) && value >= 1
+          ? Math.floor(value)
+          : undefined;
+
+      if (vendor?.categories) {
         try {
-          if (vendor.categories) vendorCategories = JSON.parse(vendor.categories) as string[];
+          const parsedCats: unknown = JSON.parse(vendor.categories);
+          if (Array.isArray(parsedCats)) {
+            vendorCategories = parsedCats.filter(
+              (c): c is string => typeof c === 'string' && c.trim().length > 0
+            );
+          }
         } catch {
-          // ignore
+          // Safe degradation: ignore malformed vendor categories JSON
         }
       }
 
       try {
-        const activePolicy = repos.policyVersions.getActive();
-        if (activePolicy?.rules) {
-          const rules = JSON.parse(activePolicy.rules) as Record<string, unknown>;
-          if (typeof rules.auto_approve_threshold_minor === 'number') autoLimitMinor = rules.auto_approve_threshold_minor;
-          if (typeof rules.hard_cap_minor === 'number') hardCapMinor = rules.hard_cap_minor;
-          if (typeof rules.daily_budget_minor === 'number') globalBudgetMinor = rules.daily_budget_minor;
-          if (rules.new_vendor_action === 'HOLD' || rules.new_vendor_action === 'DENY') {
-            newVendorAction = rules.new_vendor_action;
+        const policyVersion =
+          (request.policy_version_id
+            ? repos.policyVersions.getById(request.policy_version_id)
+            : undefined) ?? repos.policyVersions.getActive();
+
+        if (policyVersion?.rules) {
+          const parsedRules: unknown = JSON.parse(policyVersion.rules);
+          if (parsedRules && typeof parsedRules === 'object' && !Array.isArray(parsedRules)) {
+            const rules = parsedRules as Record<string, unknown>;
+            autoLimitMinor = readNonNegativeInt(rules.auto_limit_minor);
+            hardCapMinor = readNonNegativeInt(rules.hard_cap_minor);
+            agentBudgetMinor = readNonNegativeInt(rules.agent_daily_budget_minor);
+            globalBudgetMinor = readNonNegativeInt(rules.global_daily_budget_minor);
+            duplicateWindowMinutes = readNonNegativeInt(rules.duplicate_window_minutes);
+
+            if (rules.velocity && typeof rules.velocity === 'object' && !Array.isArray(rules.velocity)) {
+              const vel = rules.velocity as Record<string, unknown>;
+              velocityMaxRequests = readPositiveInt(vel.max_requests);
+              velocityWindowMinutes = readPositiveInt(vel.window_minutes);
+            }
+
+            if (rules.new_vendor_action === 'HOLD' || rules.new_vendor_action === 'DENY') {
+              newVendorAction = rules.new_vendor_action;
+            }
+
+            if (Array.isArray(rules.currency_allowlist)) {
+              const currencies = rules.currency_allowlist
+                .filter((c): c is string => typeof c === 'string' && c.trim().length > 0)
+                .map((c) => c.trim());
+              if (currencies.length > 0) {
+                allowedCurrencies = currencies;
+              }
+            }
           }
-          if (Array.isArray(rules.allowed_currencies)) allowedCurrencies = rules.allowed_currencies as string[];
         }
       } catch {
         // Safe degradation: explanation engine handles missing context gracefully
@@ -404,7 +478,11 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         purpose: request.purpose,
         autoLimitMinor,
         hardCapMinor,
+        agentBudgetMinor,
         globalBudgetMinor,
+        velocityWindowMinutes,
+        velocityMaxRequests,
+        duplicateWindowMinutes,
         newVendorAction,
         allowedCurrencies,
         vendorCategories,
@@ -485,123 +563,80 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
   // 4. Direct Owner Approval (/api/requests/:id/approve)
   // ==========================================================================
   router.post('/requests/:id/approve', async (req: Request, res: Response): Promise<void> => {
+    const requestId = req.params.id as string;
+    const ownerSession = req.ownerSession!;
+
     try {
-      const requestId = req.params.id as string;
-      const ownerSession = req.ownerSession!;
-
-      // Step 1: Pre-validation and Lazy Expiry
-      let request = repos.paymentRequests.getById(requestId);
-      if (!request) {
-        res.status(404).json({ error: 'Payment request not found' });
-        return;
-      }
-
-      if (
-        request.status === 'HELD' &&
-        request.expires_at &&
-        new Date(request.expires_at).getTime() <= Date.now()
-      ) {
-        await expirePaymentHold(db, requestId, {
-          repos,
-          authorizationsService,
-          logger,
-        });
-        res.status(410).json({
-          error: 'HOLD_EXPIRED',
-          message: 'Payment hold has expired and cannot be approved',
-        });
-        return;
-      }
-
-      // Step 2: Atomic SQLite State Transition & Token Invalidation
-      const claimResult = runInTransaction(db, () => {
-        request = repos.paymentRequests.getById(requestId);
-        if (!request) {
-          return { success: false, statusCode: 404, error: 'Payment request not found' };
-        }
-
-        if (request.status !== 'HELD') {
-          return {
-            success: false,
-            statusCode: 409,
-            error: 'INVALID_STATUS',
-            message: `Request is in '${request.status}' status, cannot be approved`,
-          };
-        }
-
-        if (
-          request.expires_at &&
-          new Date(request.expires_at).getTime() <= Date.now()
-        ) {
-          return {
-            success: false,
-            statusCode: 410,
-            error: 'HOLD_EXPIRED',
-            message: 'Payment hold has expired',
-          };
-        }
-
-        const nowIso = new Date().toISOString();
-
-        // Atomically invalidate all outstanding approval tokens for this request
-        repos.approvals.invalidateForRequest(requestId, nowIso);
-
-        // Transition HELD -> APPROVED with actor 'owner'
-        const { request: updatedRequest } = transitionPaymentRequest(db, repos, {
+      const outcome = await approvalExecutionService.execute({
+        action: 'APPROVE',
+        credentials: {
+          channel: 'dashboard',
           requestId,
-          to: 'APPROVED',
-          actor: 'owner',
-          event: 'OWNER_APPROVED',
-          timestamp: nowIso,
-          payload: {
-            channel: 'dashboard',
-            owner_display_name: ownerSession.displayName,
-          },
-        });
-
-        return { success: true, request: updatedRequest };
+          ownerId: ownerSession.ownerId,
+          ownerDisplayName: ownerSession.displayName,
+        },
       });
 
-      if (!claimResult.success || !claimResult.request) {
-        res.status(claimResult.statusCode ?? 400).json({
-          error: claimResult.error,
-          message: claimResult.message,
+      if (outcome.action === 'APPROVE') {
+        if (outcome.status === 'CAPTURED') {
+          res.status(200).json({
+            success: true,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            executedAction: outcome.executedAction,
+            captureId: outcome.captureId,
+          });
+          return;
+        }
+
+        if (outcome.status === 'CAPTURING') {
+          res.status(202).json({
+            success: false,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            error: outcome.error,
+            message: outcome.message,
+            warning: outcome.message,
+            reconciliationRequired: outcome.reconciliationRequired,
+          });
+          return;
+        }
+
+        if (outcome.status === 'FAILED') {
+          res.status(500).json({
+            success: false,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            error: outcome.error,
+            message: outcome.message,
+          });
+          return;
+        }
+      }
+
+      res.status(500).json({
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: 'Unexpected execution state',
+      });
+    } catch (err: unknown) {
+      if (err instanceof ApprovalValidationError) {
+        if (err.code === 'HOLD_EXPIRED') {
+          await approvalExecutionService.expireHoldTracked(requestId);
+        }
+        res.status(err.statusCode).json({
+          error: err.code === 'REQUEST_NOT_FOUND' ? err.message : err.code,
+          message: err.message,
         });
         return;
       }
 
-      // Step 3: Flow C Capture via executeDecision (Only Money-Moving Caller)
-      try {
-        const execResult = await executeDecision(
-          { requestId },
-          {
-            db,
-            repos,
-            actor: 'owner',
-            authorizationsService,
-            ordersService,
-          }
-        );
-
-        res.status(200).json({
-          success: true,
-          status: execResult.status,
-          captureId: execResult.captureId,
-          orderId: execResult.orderId,
-        });
-      } catch (execErr: unknown) {
-        // executeDecision fails closed and marks FAILED or leaves CAPTURING
-        logger?.error?.('[OwnerApi] Execution error during owner approval capture:', execErr);
-        const currentReq = repos.paymentRequests.getById(requestId);
-        res.status(200).json({
-          success: true,
-          status: currentReq?.status ?? 'CAPTURING',
-          warning: 'Capture in progress or awaiting reconciliation',
-        });
-      }
-    } catch (err: unknown) {
       logger?.error?.('[OwnerApi] Error in POST /requests/:id/approve:', err);
-      res.status(500).json({ error: 'Failed to execute payment approval' });
+      res.status(500).json({
+        success: false,
+        error: 'EXECUTION_ERROR',
+        message: 'Failed to execute payment approval',
+      });
     }
   });
 
@@ -609,193 +644,98 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
   // 5. Direct Owner Void (/api/requests/:id/void)
   // ==========================================================================
   router.post('/requests/:id/void', async (req: Request, res: Response): Promise<void> => {
+    const requestId = req.params.id as string;
+    const ownerSession = req.ownerSession!;
+    const voidReason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim()
+        : 'Owner voided hold from dashboard';
+
     try {
-      const requestId = req.params.id as string;
-      const ownerSession = req.ownerSession!;
-
-      // Step 1: Pre-validation and Lazy Expiry
-      let request = repos.paymentRequests.getById(requestId);
-      if (!request) {
-        res.status(404).json({ error: 'Payment request not found' });
-        return;
-      }
-
-      if (
-        request.status === 'HELD' &&
-        request.expires_at &&
-        new Date(request.expires_at).getTime() <= Date.now()
-      ) {
-        await expirePaymentHold(db, requestId, {
-          repos,
-          authorizationsService,
-          logger,
-        });
-        res.status(200).json({
-          success: true,
-          status: 'VOIDED',
-          message: 'Payment hold expired and voided',
-        });
-        return;
-      }
-
-      // Step 2: Atomic SQLite Claim Transaction
-      const claimResult = runInTransaction(db, () => {
-        request = repos.paymentRequests.getById(requestId);
-        if (!request) {
-          return { success: false, statusCode: 404, error: 'Payment request not found' };
-        }
-
-        if (request.status === 'VOIDED') {
-          return {
-            success: true,
-            request,
-            alreadyVoided: true,
-          };
-        }
-
-        if (request.status !== 'HELD') {
-          return {
-            success: false,
-            statusCode: 409,
-            error: 'INVALID_STATUS',
-            message: `Request is in '${request.status}' status, cannot be voided`,
-          };
-        }
-
-        const nowIso = new Date().toISOString();
-
-        // Invalidate all open approval tokens
-        repos.approvals.invalidateForRequest(requestId, nowIso);
-
-        // Verify ledger entries: Release reservation if not already released
-        const ledgerEntries = repos.ledger.listByRequestId(requestId);
-        const hasSpend = ledgerEntries.some((l) => l.kind === 'SPEND');
-        if (hasSpend) {
-          throw new Error('Illegal ledger state: cannot void request with existing SPEND entry');
-        }
-
-        const hasRelease = ledgerEntries.some((l) => l.kind === 'RELEASE');
-        if (!hasRelease) {
-          repos.ledger.insert({
-            id: `led-${crypto.randomUUID()}`,
-            request_id: requestId,
-            kind: 'RELEASE',
-            amount_minor: request.amount_minor,
-            currency: request.currency,
-            created_at: nowIso,
-          });
-        }
-
-        // Set remote_void_status = 'PENDING'
-        repos.paymentRequests.updateRemoteVoidStatus(requestId, 'PENDING', nowIso);
-
-        const reason =
-          typeof req.body?.reason === 'string' && req.body.reason.trim()
-            ? req.body.reason.trim()
-            : 'Owner voided hold from dashboard';
-
-        // Transition HELD -> VOIDED
-        const { request: updatedRequest } = transitionPaymentRequest(db, repos, {
+      const outcome = await approvalExecutionService.execute({
+        action: 'VOID',
+        credentials: {
+          channel: 'dashboard',
           requestId,
-          to: 'VOIDED',
-          actor: 'owner',
-          event: 'OWNER_VOIDED',
-          timestamp: nowIso,
-          payload: {
-            channel: 'dashboard',
-            owner_display_name: ownerSession.displayName,
-            reason,
-          },
-        });
-
-        return {
-          success: true,
-          request: updatedRequest,
-          authId: request.paypal_authorization_id,
-          alreadyVoided: false,
-        };
+          ownerId: ownerSession.ownerId,
+          ownerDisplayName: ownerSession.displayName,
+          reason: voidReason,
+        },
       });
 
-      if (!claimResult.success || !claimResult.request) {
-        res.status(claimResult.statusCode ?? 400).json({
-          error: claimResult.error,
-          message: claimResult.message,
-        });
-        return;
-      }
-
-      if (claimResult.alreadyVoided) {
-        res.status(200).json({
-          success: true,
-          status: 'VOIDED',
-          message: 'Payment request was already voided',
-        });
-        return;
-      }
-
-      // Step 3: Remote PayPal Authorization Cancellation (Outside DB Transaction)
-      const authId = claimResult.authId;
-      let remoteVoidStatus: 'PENDING' | 'CONFIRMED' | 'FAILED' = 'PENDING';
-      const nowIso = new Date().toISOString();
-
-      if (authId && authorizationsService) {
-        try {
-          const voidRes = await authorizationsService.voidAuthorization({
-            authorizationId: authId,
-            requestId,
+      if (outcome.action === 'VOID') {
+        if (outcome.alreadyVoided || outcome.remoteVoidSuccess) {
+          res.status(200).json({
+            success: true,
+            requestId: outcome.requestId,
+            status: outcome.status,
+            remoteVoidStatus: outcome.remoteVoidStatus,
+            remoteVoidSuccess: outcome.remoteVoidSuccess,
+            ...(outcome.message ? { message: outcome.message } : {}),
           });
-
-          if (voidRes.isVoided) {
-            remoteVoidStatus = 'CONFIRMED';
-            repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
-            writeAuditLogEntry(db, repos, {
-              actor: 'system',
-              event: 'PAYPAL_VOID_RECONCILED',
-              requestId,
-              timestamp: nowIso,
-              payload: {
-                authorizationId: authId,
-                reason: 'Remote authorization void confirmed for owner action',
-                remote_void_status: 'CONFIRMED',
-              },
-            });
-          }
-        } catch (err: unknown) {
-          const isDefinitive =
-            err instanceof AuthorizationError &&
-            (err.code === 'INVALID_REQUEST' || err.code === 'DECLINED');
-
-          if (isDefinitive) {
-            remoteVoidStatus = 'FAILED';
-            repos.paymentRequests.updateRemoteVoidStatus(requestId, 'FAILED', nowIso);
-            writeAuditLogEntry(db, repos, {
-              actor: 'system',
-              event: 'PAYPAL_VOID_FAILED',
-              requestId,
-              timestamp: nowIso,
-              payload: {
-                authorizationId: authId,
-                error: err instanceof Error ? err.message : String(err),
-                remote_void_status: 'FAILED',
-              },
-            });
-          } else {
-            // Transient or network failure: leave PENDING for ReconcilerWorker
-            logger?.warn?.(`[OwnerApi] Transient error during remote void for ${requestId}:`, err);
-          }
+          return;
         }
-      } else {
-        // No PayPal authorization existed to cancel
-        remoteVoidStatus = 'CONFIRMED';
-        repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
+
+        res.status(202).json({
+          success: true,
+          requestId: outcome.requestId,
+          status: outcome.status,
+          remoteVoidStatus: outcome.remoteVoidStatus,
+          remoteVoidSuccess: false,
+          reconciliationRequired: true,
+          message: outcome.message,
+        });
+        return;
       }
 
-      res.status(200).json({
-        success: true,
-        status: 'VOIDED',
-        remoteVoidStatus,
+      res.status(500).json({
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: 'Unexpected execution state',
       });
     } catch (err: unknown) {
+      if (err instanceof ApprovalValidationError) {
+        if (err.code === 'HOLD_EXPIRED') {
+          const expiryResult = await approvalExecutionService.expireHoldTracked(requestId);
+          if (expiryResult.expired) {
+            const remoteVoidStatus = expiryResult.remoteVoidStatus ?? 'PENDING';
+            const confirmed = remoteVoidStatus === 'CONFIRMED';
+            res.status(confirmed ? 200 : 202).json({
+              success: true,
+              requestId,
+              status: 'VOIDED',
+              remoteVoidStatus,
+              remoteVoidSuccess: confirmed,
+              ...(confirmed ? {} : { reconciliationRequired: true }),
+              message: 'Payment hold expired and voided',
+            });
+            return;
+          }
+
+          const currentReq = repos.paymentRequests.getById(requestId);
+          if (currentReq?.status === 'VOIDED') {
+            const currentVoidStatus = currentReq.remote_void_status ?? 'CONFIRMED';
+            const confirmed = currentVoidStatus === 'CONFIRMED';
+            res.status(confirmed ? 200 : 202).json({
+              success: true,
+              requestId,
+              status: 'VOIDED',
+              remoteVoidStatus: currentVoidStatus,
+              remoteVoidSuccess: confirmed,
+              ...(confirmed ? {} : { reconciliationRequired: true }),
+              message: 'Payment hold expired and voided',
+            });
+            return;
+          }
+        }
+
+        res.status(err.statusCode).json({
+          error: err.code === 'REQUEST_NOT_FOUND' ? err.message : err.code,
+          message: err.message,
+        });
+        return;
+      }
+
       logger?.error?.('[OwnerApi] Error in POST /requests/:id/void:', err);
       res.status(500).json({ error: 'Failed to void payment hold' });
     }
@@ -943,6 +883,26 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         return;
       }
 
+      const effectiveMaxHardCapMinor = resolveMaxHardCapMinor();
+      const storedCeilingCheck = validateHardCapWithinCeiling(
+        validatedStoredRules.hard_cap_minor,
+        effectiveMaxHardCapMinor
+      );
+      if (!storedCeilingCheck.valid) {
+        res.status(400).json({
+          error: 'RULE_CONSTRAINT_VIOLATION',
+          message:
+            storedCeilingCheck.message ??
+            'Proposed policy exceeds configured MAX_HARD_CAP_MINOR ceiling',
+          details: {
+            field: 'hard_cap_minor',
+            hard_cap_minor: validatedStoredRules.hard_cap_minor,
+            max_hard_cap_minor: effectiveMaxHardCapMinor,
+          },
+        });
+        return;
+      }
+
       // Step 6: Relaxation acknowledgement check (Safeguard 6)
       if (proposal.has_relaxations === 1 && !acknowledgeRelaxations) {
         let relaxationsList: unknown[] = [];
@@ -1005,6 +965,26 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
               error: 'RULE_CONSTRAINT_VIOLATION',
               message: 'Policy document validation failed',
               details: parseResult.error.format(),
+            };
+          }
+
+          const txCeilingCheck = validateHardCapWithinCeiling(
+            parseResult.data.hard_cap_minor,
+            effectiveMaxHardCapMinor
+          );
+          if (!txCeilingCheck.valid) {
+            return {
+              success: false,
+              statusCode: 400,
+              error: 'RULE_CONSTRAINT_VIOLATION',
+              message:
+                txCeilingCheck.message ??
+                'Policy exceeds configured MAX_HARD_CAP_MINOR ceiling',
+              details: {
+                field: 'hard_cap_minor',
+                hard_cap_minor: parseResult.data.hard_cap_minor,
+                max_hard_cap_minor: effectiveMaxHardCapMinor,
+              },
             };
           }
 
@@ -1222,68 +1202,101 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
         return;
       }
 
-      // Determine next version number
-      const nextVersion = repos.policyVersions.getNextVersion();
-
-      // Merge with version for canonical schema validation
-      const candidateDoc = {
-        ...rawBody,
-        version: nextVersion,
+      let createdPolicy: {
+        id: string;
+        version: number;
+        rules: PolicyDocument;
+        createdAt: string;
       };
 
-      const parseResult = PolicyDocumentSchema.safeParse(candidateDoc);
-      if (!parseResult.success) {
-        res.status(400).json({
-          error: 'Policy document validation failed',
-          details: parseResult.error.format(),
+      try {
+        createdPolicy = runInTransaction(db, () => {
+          // Determine next version number atomically inside transaction
+          const nextVersion = repos.policyVersions.getNextVersion();
+
+          // Merge with version for canonical schema validation
+          const candidateDoc = {
+            ...rawBody,
+            version: nextVersion,
+          };
+
+          const parseResult = PolicyDocumentSchema.safeParse(candidateDoc);
+          if (!parseResult.success) {
+            throw new PolicyValidationError('Policy document validation failed', parseResult.error.format());
+          }
+
+          const validatedRules = parseResult.data;
+          const effectiveMaxHardCapMinor = resolveMaxHardCapMinor();
+          const ceilingCheck = validateHardCapWithinCeiling(
+            validatedRules.hard_cap_minor,
+            effectiveMaxHardCapMinor
+          );
+          if (!ceilingCheck.valid) {
+            throw new PolicyValidationError(
+              ceilingCheck.message ?? 'Policy exceeds configured MAX_HARD_CAP_MINOR ceiling',
+              {
+                field: 'hard_cap_minor',
+                hard_cap_minor: validatedRules.hard_cap_minor,
+                max_hard_cap_minor: effectiveMaxHardCapMinor,
+              }
+            );
+          }
+
+          const newPolicyId = `pol-${crypto.randomUUID()}`;
+          const nowIso = new Date().toISOString();
+
+          // Insert new policy first with active = 0 to avoid unique constraint conflict
+          repos.policyVersions.insert({
+            id: newPolicyId,
+            version: nextVersion,
+            rules: JSON.stringify(validatedRules),
+            author: 'owner',
+            active: 0,
+            created_at: nowIso,
+          });
+
+          // Atomically switch active version
+          repos.policyVersions.setActive(newPolicyId);
+
+          // Write audit log entry in the same transaction (Hard Rule 7)
+          writeAuditLogEntry(db, repos, {
+            actor: 'owner',
+            event: 'POLICY_ACTIVATED',
+            timestamp: nowIso,
+            payload: {
+              policy_version_id: newPolicyId,
+              version: nextVersion,
+              author: 'owner',
+            },
+          });
+
+          return {
+            id: newPolicyId,
+            version: nextVersion,
+            rules: validatedRules,
+            createdAt: nowIso,
+          };
         });
+      } catch (err: unknown) {
+        if (err instanceof PolicyValidationError) {
+          res.status(400).json({
+            error: err.message,
+            details: err.details,
+          });
+          return;
+        }
+        logger?.error?.('[OwnerApi] Error in POST /policies:', err);
+        res.status(500).json({ error: 'Failed to create and activate policy version' });
         return;
       }
 
-      const validatedRules = parseResult.data;
-      const newPolicyId = `pol-${crypto.randomUUID()}`;
-      const nowIso = new Date().toISOString();
-
-      // Atomic insertion and active switch in a single SQLite transaction
-      const newPolicyRow: PolicyVersionRow = {
-        id: newPolicyId,
-        version: nextVersion,
-        rules: JSON.stringify(validatedRules),
-        author: 'owner',
-        active: 1,
-        created_at: nowIso,
-      };
-
-      runInTransaction(db, () => {
-        // Insert new policy first with active = 0 to avoid unique constraint conflict
-        repos.policyVersions.insert({
-          ...newPolicyRow,
-          active: 0,
-        });
-
-        // Atomically switch active version
-        repos.policyVersions.setActive(newPolicyId);
-
-        // Write audit log entry in the same transaction (Hard Rule 7)
-        writeAuditLogEntry(db, repos, {
-          actor: 'owner',
-          event: 'POLICY_ACTIVATED',
-          timestamp: nowIso,
-          payload: {
-            policy_version_id: newPolicyId,
-            version: nextVersion,
-            author: 'owner',
-          },
-        });
-      });
-
       res.status(201).json({
-        id: newPolicyId,
-        version: nextVersion,
-        rules: validatedRules,
+        id: createdPolicy.id,
+        version: createdPolicy.version,
+        rules: createdPolicy.rules,
         author: 'owner',
         active: true,
-        createdAt: nowIso,
+        createdAt: createdPolicy.createdAt,
       });
     } catch (err: unknown) {
       logger?.error?.('[OwnerApi] Error in POST /policies:', err);
@@ -1357,8 +1370,11 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
       }
 
       const { version: _actV, ...activeClean } = activeParse.data;
+      const effectiveMaxHardCapMinor = resolveMaxHardCapMinor();
 
-      const drafter = new PolicyDrafter(aiService);
+      const drafter = new PolicyDrafter(aiService, undefined, {
+        maxHardCapMinor: effectiveMaxHardCapMinor,
+      });
 
       let draftResult;
       try {
@@ -1366,24 +1382,37 @@ export function createOwnerApiRouter(options: OwnerApiRouterOptions): Router {
           prompt,
           activePolicy: activeClean,
           baseVersion: activePolicy.version,
+          maxHardCapMinor: effectiveMaxHardCapMinor,
         });
       } catch (drafterErr: unknown) {
         if (drafterErr instanceof PolicyDrafterError) {
-          const status =
-            drafterErr.code === 'INJECTION_DETECTED'
-              ? 400
-              : drafterErr.code === 'INJECTION_SCAN_INDETERMINATE'
-              ? 422
-              : drafterErr.code === 'AI_SERVICE_RATE_LIMITED'
-              ? 429
-              : drafterErr.code === 'AI_SERVICE_TIMEOUT'
-              ? 504
-              : drafterErr.code === 'AI_SERVICE_UNAVAILABLE'
-              ? 502
-              : 400;
+          let status = 400;
+          let errorCode = drafterErr.code;
+
+          if (drafterErr.code === 'INJECTION_SCAN_INDETERMINATE') {
+            status = 422;
+          } else if (
+            drafterErr.code === 'AI_RATE_LIMITED' ||
+            drafterErr.code === 'AI_SERVICE_RATE_LIMITED'
+          ) {
+            status = 429;
+            errorCode = 'AI_SERVICE_RATE_LIMITED';
+          } else if (
+            drafterErr.code === 'AI_TIMEOUT' ||
+            drafterErr.code === 'AI_SERVICE_TIMEOUT'
+          ) {
+            status = 504;
+            errorCode = 'AI_SERVICE_TIMEOUT';
+          } else if (
+            drafterErr.code === 'AI_PROVIDER_ERROR' ||
+            drafterErr.code === 'AI_SERVICE_UNAVAILABLE'
+          ) {
+            status = 502;
+            errorCode = 'AI_SERVICE_UNAVAILABLE';
+          }
 
           res.status(status).json({
-            error: drafterErr.code,
+            error: errorCode,
             message: drafterErr.message,
             details: drafterErr.details,
           });

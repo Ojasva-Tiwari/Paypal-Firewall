@@ -26,6 +26,7 @@ import type {
   AuditLogRow,
 } from '../db/types.js';
 import type { MinorUnits } from './money.js';
+import { formatMinorUnitsToDecimal } from './money.js';
 import type { PolicyDocument, PolicyRequest, ReasonCode } from '../policy/types.js';
 import { evaluatePolicy } from '../policy/engine.js';
 import { gatherFacts } from './facts.js';
@@ -34,6 +35,13 @@ import {
   writeAuditLogEntry,
   type PaymentRequestStatus,
 } from './stateMachine.js';
+import {
+  formatPaymentHeldMessage,
+  formatPaymentDeniedMessage,
+  formatBudgetWarningMessage,
+  enqueuePaymentNotification,
+} from '../telegram/notifications.js';
+import { sanitizePublicBaseUrl } from '../config/index.js';
 
 // ============================================================================
 // Error Classes
@@ -161,6 +169,9 @@ export interface EvaluateAndReserveParams {
   readonly now?: Date;
   readonly requestId?: string;
   readonly autoExecute?: boolean;
+  readonly publicBaseUrl?: string;
+  readonly isProduction?: boolean;
+  readonly telegramEncryptionKey?: string;
 }
 
 export interface EvaluateAndReserveResult {
@@ -421,6 +432,113 @@ export function evaluateAndReserve(
         decision: evaluation.decision,
       },
     });
+
+    // 8. Enqueue Telegram notifications if owner is linked
+    const isProd = params.isProduction ?? process.env.NODE_ENV === 'production';
+    const hasExplicitBaseUrl = 'publicBaseUrl' in params;
+    const publicBaseUrl = hasExplicitBaseUrl
+      ? sanitizePublicBaseUrl(params.publicBaseUrl, isProd)
+      : sanitizePublicBaseUrl(process.env.PUBLIC_BASE_URL, isProd) ??
+        (isProd ? undefined : 'http://localhost:3000');
+
+    if (evaluation.decision === 'HOLD') {
+      const text = formatPaymentHeldMessage({
+        requestId,
+        amountDecimal: formatMinorUnitsToDecimal(params.amountMinor),
+        currency: params.currency,
+        vendorName: vendor.name,
+        purpose: params.purpose,
+        expiresAt: expiresAt ?? '',
+        publicBaseUrl,
+        isProduction: isProd,
+      });
+      const hasExplicitEncryptionKey = 'telegramEncryptionKey' in params;
+      const encryptionKey = hasExplicitEncryptionKey
+        ? params.telegramEncryptionKey
+        : process.env.TELEGRAM_ENCRYPTION_KEY;
+      enqueuePaymentNotification(repos, {
+        eventType: 'PAYMENT_HELD',
+        requestId,
+        dedupKey: `payment_held:${requestId}`,
+        messageText: text,
+        snapshotHash: snapshotHash ?? undefined,
+        expiresAt: expiresAt ?? undefined,
+        encryptionKey,
+      });
+    } else if (evaluation.decision === 'DENY') {
+      const text = formatPaymentDeniedMessage({
+        requestId,
+        amountDecimal: formatMinorUnitsToDecimal(params.amountMinor),
+        currency: params.currency,
+        vendorName: vendor.name,
+        reasons: evaluation.reasons,
+      });
+      enqueuePaymentNotification(repos, {
+        eventType: 'PAYMENT_DENIED',
+        requestId,
+        dedupKey: `payment_denied:${requestId}`,
+        messageText: text,
+      });
+    }
+
+    // Budget threshold warnings (80% and 100%)
+    if (policyDoc.global_daily_budget_minor > 0) {
+      const globalCommitted =
+        facts.globalSpendRolling24hMinor +
+        facts.globalReservedRolling24hMinor +
+        (evaluation.decision !== 'DENY' ? params.amountMinor : 0);
+      const globalPct = Math.floor(
+        (globalCommitted / policyDoc.global_daily_budget_minor) * 100
+      );
+      if (globalPct >= 80) {
+        const threshold = globalPct >= 100 ? 100 : 80;
+        const text = formatBudgetWarningMessage({
+          targetType: 'GLOBAL',
+          targetName: 'Global 24h Rolling Budget',
+          targetId: 'global',
+          usedDecimal: formatMinorUnitsToDecimal(globalCommitted),
+          totalDecimal: formatMinorUnitsToDecimal(policyDoc.global_daily_budget_minor),
+          currency: params.currency,
+          percent: globalPct,
+          publicBaseUrl,
+          isProduction: isProd,
+        });
+        enqueuePaymentNotification(repos, {
+          eventType: 'BUDGET_WARNING',
+          dedupKey: `budget_warning:global:${threshold}:${nowIso.slice(0, 13)}`,
+          messageText: text,
+        });
+      }
+    }
+
+    if (policyDoc.agent_daily_budget_minor > 0) {
+      const agentCommitted =
+        facts.agentSpendRolling24hMinor +
+        facts.agentReservedRolling24hMinor +
+        (evaluation.decision !== 'DENY' ? params.amountMinor : 0);
+      const agentPct = Math.floor(
+        (agentCommitted / policyDoc.agent_daily_budget_minor) * 100
+      );
+      if (agentPct >= 80) {
+        const threshold = agentPct >= 100 ? 100 : 80;
+        const text = formatBudgetWarningMessage({
+          targetType: 'AGENT',
+          targetName: agent.name,
+          targetId: agent.id,
+          usedDecimal: formatMinorUnitsToDecimal(agentCommitted),
+          totalDecimal: formatMinorUnitsToDecimal(policyDoc.agent_daily_budget_minor),
+          currency: params.currency,
+          percent: agentPct,
+          publicBaseUrl,
+          isProduction: isProd,
+        });
+        enqueuePaymentNotification(repos, {
+          eventType: 'BUDGET_WARNING',
+          dedupKey: `budget_warning:agent:${agent.id}:${threshold}:${nowIso.slice(0, 13)}`,
+          messageText: text,
+        });
+      }
+    }
 
     return {
       request: transitionResult.request,

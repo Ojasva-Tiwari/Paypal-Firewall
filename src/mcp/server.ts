@@ -35,12 +35,20 @@ import { AgentRateLimiter, createRateLimitMiddleware } from './rateLimiter.js';
 import { createAuthRouter } from '../api/auth.js';
 import { createOwnerApiRouter } from '../api/owner.js';
 import { createApprovalRouter } from '../approvals/routes.js';
+import { ApprovalExecutionService } from '../approvals/service.js';
 import { HoldExpiryWorker } from '../approvals/expiry.js';
 import { ReconcilerWorker } from '../paypal/reconcile.js';
 import { OwnerSessionStore, LoginRateLimiter } from '../auth/owner.js';
 import type { AiService } from '../ai/service.js';
 import { createAiService } from '../ai/index.js';
 import { getConfig, type PayGuardConfig } from '../config/index.js';
+import {
+  TelegramClient,
+  createTelegramRouter,
+  createTelegramWebhookAuthMiddleware,
+  UpdateDeduplicator,
+  NotificationOutboxWorker,
+} from '../telegram/index.js';
 import {
   handleRequestPayment,
   handleGetPaymentStatus,
@@ -182,10 +190,15 @@ export interface McpServerOptions {
   };
   readonly holdExpiryWorkerIntervalMs?: number; // default: 30,000 (30s)
   readonly reconcilerWorkerIntervalMs?: number; // default: 60,000 (60s)
+  readonly notificationOutboxWorkerIntervalMs?: number; // default: 2,000 (2s)
+  readonly ownerSessionCleanupIntervalMs?: number; // default: 60,000 (60s)
   readonly staticDir?: string;
   readonly config?: PayGuardConfig;
   readonly aiService?: AiService;
   readonly trustProxy?: boolean | number | string;
+  readonly telegramClient?: TelegramClient;
+  readonly telegramDeduplicator?: UpdateDeduplicator;
+  readonly approvalExecutionService?: ApprovalExecutionService;
 }
 
 export interface PayGuardMcpServerInstance {
@@ -196,12 +209,16 @@ export interface PayGuardMcpServerInstance {
   readonly getActiveSessionCount: () => number;
   readonly getSession: (sessionId: string) => { sessionId: string; agentId: string } | undefined;
   readonly cleanupExpiredSessions: (maxIdleAgeMs?: number) => void;
+  readonly cleanupExpiredOwnerSessions: (now?: number) => number;
   readonly rateLimiter: AgentRateLimiter;
   readonly ownerSessionStore: OwnerSessionStore;
   readonly loginRateLimiter: LoginRateLimiter;
   readonly holdExpiryWorker: HoldExpiryWorker;
   readonly reconcilerWorker: ReconcilerWorker;
+  readonly notificationOutboxWorker?: NotificationOutboxWorker;
   readonly aiService?: AiService;
+  readonly telegramClient?: TelegramClient;
+  readonly approvalExecutionService: ApprovalExecutionService;
 }
 
 // ============================================================================
@@ -222,15 +239,16 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       windowMs: options.rateLimitWindowMs ?? 60_000,
     });
 
+  const resolvedConfig = options.config ?? getConfig();
+
   // Resolve AI Service instance:
   // 1. Explicitly supplied options.aiService always takes precedence (Requirement 2).
   // 2. Otherwise, automatically initialize via createAiService() based on config (Requirement 1 & 3).
   let resolvedAiService: AiService | undefined = options.aiService;
   if (resolvedAiService === undefined) {
-    const config = options.config ?? getConfig();
     try {
       resolvedAiService = createAiService({
-        config,
+        config: resolvedConfig,
         repos,
       });
     } catch (err: unknown) {
@@ -239,7 +257,7 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       // - Never silently substitute mock output when Gemini initialization fails.
       // - Do not expose API keys, credentials or sensitive configuration in logs.
       const safeMsg = err instanceof Error ? err.message : String(err);
-      const warnMsg = `[Server] AI service initialization failed for provider '${config.aiProvider}'; AI advisory disabled: ${safeMsg}`;
+      const warnMsg = `[Server] AI service initialization failed for provider '${resolvedConfig.aiProvider}'; AI advisory disabled: ${safeMsg}`;
       if (options.logger?.warn) {
         options.logger.warn(warnMsg);
       } else {
@@ -248,6 +266,19 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       resolvedAiService = undefined;
     }
   }
+
+  // Shared ApprovalExecutionService instance (M6-T3 Subtask 3.1)
+  const approvalExecutionService =
+    options.approvalExecutionService ??
+    new ApprovalExecutionService({
+      db,
+      repos,
+      authorizationsService: options.authorizationsService,
+      ordersService: options.ordersService,
+      publicBaseUrl: resolvedConfig.publicBaseUrl,
+      isProduction: resolvedConfig.isProduction,
+      logger: options.logger,
+    });
 
   // Session Registry: maps sessionId -> ActiveSession
   const sessionRegistry = new Map<string, ActiveSession>();
@@ -291,11 +322,19 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
             ordersService: options.ordersService,
             authorizationsService: options.authorizationsService,
             defaultVaultTokenId: options.defaultVaultTokenId,
-            config: options.config ?? getConfig(),
+            config: resolvedConfig,
+            publicBaseUrl: resolvedConfig.publicBaseUrl,
+            isProduction: resolvedConfig.isProduction,
+            telegramEncryptionKey: resolvedConfig.telegramEncryptionKey,
             aiService: resolvedAiService,
           });
         case 'get_payment_status':
-          return await handleGetPaymentStatus(db, toolArgs, repos);
+          return await handleGetPaymentStatus(db, toolArgs, repos, {
+            authorizationsService: options.authorizationsService,
+            approvalExecutionService,
+            publicBaseUrl: resolvedConfig.publicBaseUrl,
+            isProduction: resolvedConfig.isProduction,
+          });
         case 'get_budget':
           return await handleGetBudget(db, toolArgs, repos);
         case 'list_vendors':
@@ -353,8 +392,20 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
   const app = express();
 
   // Configurable, secure trust proxy setting (Requirement 10, default: false)
-  const trustProxy = options.trustProxy ?? options.config?.trustProxy ?? false;
+  const trustProxy = options.trustProxy ?? resolvedConfig.trustProxy ?? false;
   app.set('trust proxy', trustProxy);
+
+  // Enforce Telegram webhook secret verification BEFORE JSON body parsing (M6-T3-B)
+  if (resolvedConfig.telegramWebhookSecret) {
+    app.use(
+      '/api/telegram/webhook',
+      createTelegramWebhookAuthMiddleware(resolvedConfig.telegramWebhookSecret)
+    );
+  } else {
+    app.use('/api/telegram/webhook', (_req: express.Request, res: express.Response) => {
+      res.status(403).json({ error: 'Unauthorized: Telegram webhook secret not configured' });
+    });
+  }
 
   app.use(express.json({ limit: '64kb' }));
 
@@ -398,25 +449,57 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
   });
 
   // Owner Authentication Router (/api/login, /api/logout, /api/session)
-  const ownerSessionStore = options.ownerSessionStore ?? new OwnerSessionStore();
+  const ownerSessionStore = options.ownerSessionStore ?? new OwnerSessionStore({ db, repos });
   const loginRateLimiter = options.loginRateLimiter ?? new LoginRateLimiter();
+  const isProduction = resolvedConfig.isProduction;
+  const secureCookie = options.secureCookie !== undefined ? options.secureCookie : isProduction;
   const authRouter = createAuthRouter({
     db,
     repos,
     sessionStore: ownerSessionStore,
     loginRateLimiter,
-    secureCookie: options.secureCookie,
+    isProduction,
+    secureCookie,
+    logger: options.logger,
   });
   app.use('/api', authRouter);
+
+  // Telegram Bot Client & Account Linking Router (/api/telegram/status, /api/telegram/link-token, /api/telegram/unlink, /api/telegram/webhook)
+  let telegramClient = options.telegramClient;
+  if (!telegramClient && resolvedConfig.telegramBotToken) {
+    telegramClient = new TelegramClient({
+      botToken: resolvedConfig.telegramBotToken,
+      logger: options.logger,
+    });
+  }
+
+  const telegramRouter = createTelegramRouter({
+    db,
+    repos,
+    sessionStore: ownerSessionStore,
+    isProduction,
+    secureCookie,
+    config: resolvedConfig,
+    telegramClient,
+    deduplicator: options.telegramDeduplicator,
+    approvalExecutionService,
+    logger: options.logger,
+  });
+  app.use('/api/telegram', telegramRouter);
 
   // Owner Dashboard REST API (/api/overview, /api/requests, /api/policies, etc.)
   const ownerApiRouter = createOwnerApiRouter({
     db,
     repos,
     sessionStore: ownerSessionStore,
+    isProduction,
+    publicBaseUrl: resolvedConfig.publicBaseUrl,
+    secureCookie,
+    maxHardCapMinor: resolvedConfig.maxHardCapMinor,
     authorizationsService: options.authorizationsService,
     ordersService: options.ordersService,
     aiService: resolvedAiService,
+    approvalExecutionService,
     logger: options.logger,
   });
   app.use('/api', ownerApiRouter);
@@ -426,9 +509,13 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     db,
     repos,
     sessionStore: ownerSessionStore,
+    isProduction,
+    publicBaseUrl: resolvedConfig.publicBaseUrl,
+    secureCookie,
     authorizationsService: options.authorizationsService,
     ordersService: options.ordersService,
     aiService: resolvedAiService,
+    approvalExecutionService,
     logger: options.logger,
   });
   app.use('/a', approvalRouter);
@@ -439,6 +526,8 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     repos,
     authorizationsService: options.authorizationsService,
     intervalMs: options.holdExpiryWorkerIntervalMs ?? 30_000,
+    publicBaseUrl: resolvedConfig.publicBaseUrl,
+    isProduction,
     logger: options.logger,
   });
 
@@ -448,8 +537,22 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
     ordersService: options.ordersService,
     authorizationsService: options.authorizationsService,
     intervalMs: options.reconcilerWorkerIntervalMs ?? 60_000,
+    publicBaseUrl: resolvedConfig.publicBaseUrl,
+    isProduction,
     logger: options.logger,
   });
+
+  const notificationOutboxWorker = telegramClient
+    ? new NotificationOutboxWorker({
+        db,
+        repos,
+        telegramClient,
+        intervalMs: options.notificationOutboxWorkerIntervalMs ?? 2000,
+        encryptionKey: resolvedConfig.telegramEncryptionKey,
+        previousEncryptionKey: resolvedConfig.telegramPreviousEncryptionKey,
+        logger: options.logger,
+      })
+    : undefined;
 
   // Authenticated MCP Endpoint & Rate Limiting
   const authMiddleware = createAuthMiddleware(db, repos);
@@ -542,6 +645,43 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
   }
 
   let activeHttpServer: HttpServer | null = null;
+  const ownerSessionCleanupIntervalMs = Math.max(
+    10,
+    options.ownerSessionCleanupIntervalMs ?? 60_000
+  );
+  let ownerSessionCleanupTimer: NodeJS.Timeout | null = null;
+  let isShuttingDown = false;
+
+  const runOwnerSessionCleanup = (now = Date.now()): number => {
+    if (isShuttingDown || !db.open) {
+      return 0;
+    }
+    try {
+      return ownerSessionStore.cleanupExpired(now);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      options.logger?.warn?.(`[Server] Owner session cleanup skipped due to storage error: ${msg}`);
+      return 0;
+    }
+  };
+
+  const startOwnerSessionCleanup = (): void => {
+    if (isShuttingDown || ownerSessionCleanupTimer) {
+      return;
+    }
+    runOwnerSessionCleanup();
+    ownerSessionCleanupTimer = setInterval(() => {
+      runOwnerSessionCleanup();
+    }, ownerSessionCleanupIntervalMs);
+    ownerSessionCleanupTimer.unref();
+  };
+
+  const stopOwnerSessionCleanup = (): void => {
+    if (ownerSessionCleanupTimer) {
+      clearInterval(ownerSessionCleanupTimer);
+      ownerSessionCleanupTimer = null;
+    }
+  };
 
   const start = async (port = options.port ?? 0): Promise<{ port: number; close: () => Promise<void> }> => {
     if (activeHttpServer) {
@@ -563,8 +703,12 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
         httpServer.on('error', (err) => {
           if (isSettled) return;
           isSettled = true;
-          holdExpiryWorker.stop();
-          reconcilerWorker.stop();
+          isShuttingDown = true;
+          stopOwnerSessionCleanup();
+          approvalExecutionService.markShuttingDown();
+          void holdExpiryWorker.stop().catch(() => {});
+          void reconcilerWorker.stop().catch(() => {});
+          void notificationOutboxWorker?.stop().catch(() => {});
           reject(err);
         });
 
@@ -573,8 +717,11 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
           isSettled = true;
           activeHttpServer = httpServer;
           try {
+            isShuttingDown = false;
+            startOwnerSessionCleanup();
             holdExpiryWorker.start();
             reconcilerWorker.start();
+            notificationOutboxWorker?.start();
             const addr = httpServer.address();
             const resolvedPort = typeof addr === 'object' && addr !== null ? addr.port : port;
             resolve({
@@ -584,8 +731,12 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
               },
             });
           } catch (startupErr) {
-            holdExpiryWorker.stop();
-            reconcilerWorker.stop();
+            isShuttingDown = true;
+            stopOwnerSessionCleanup();
+            approvalExecutionService.markShuttingDown();
+            void holdExpiryWorker.stop().catch(() => {});
+            void reconcilerWorker.stop().catch(() => {});
+            void notificationOutboxWorker?.stop().catch(() => {});
             httpServer.close(() => {
               activeHttpServer = null;
               reject(startupErr);
@@ -595,8 +746,12 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       } catch (err) {
         if (!isSettled) {
           isSettled = true;
-          holdExpiryWorker.stop();
-          reconcilerWorker.stop();
+          isShuttingDown = true;
+          stopOwnerSessionCleanup();
+          approvalExecutionService.markShuttingDown();
+          void holdExpiryWorker.stop().catch(() => {});
+          void reconcilerWorker.stop().catch(() => {});
+          void notificationOutboxWorker?.stop().catch(() => {});
           reject(err);
         }
       }
@@ -604,8 +759,12 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
   };
 
   const close = async (): Promise<void> => {
-    holdExpiryWorker.stop();
-    reconcilerWorker.stop();
+    isShuttingDown = true;
+    stopOwnerSessionCleanup();
+    approvalExecutionService.markShuttingDown();
+    const stopHoldExpiry = holdExpiryWorker.stop();
+    const stopReconciler = reconcilerWorker.stop();
+    const stopOutbox = notificationOutboxWorker?.stop() ?? Promise.resolve();
 
     if (activeHttpServer) {
       const serverToClose = activeHttpServer;
@@ -617,6 +776,13 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
         });
       });
     }
+
+    await Promise.all([
+      stopHoldExpiry,
+      stopReconciler,
+      stopOutbox,
+      approvalExecutionService.drainPendingTasks(),
+    ]);
 
     // Clean up all active transports and server instances
     for (const session of sessionRegistry.values()) {
@@ -645,11 +811,15 @@ export function createPayGuardMcpServer(options: McpServerOptions): PayGuardMcpS
       return s ? { sessionId: s.sessionId, agentId: s.agentId } : undefined;
     },
     cleanupExpiredSessions,
+    cleanupExpiredOwnerSessions: runOwnerSessionCleanup,
     rateLimiter,
     ownerSessionStore,
     loginRateLimiter,
     holdExpiryWorker,
     reconcilerWorker,
+    notificationOutboxWorker,
     aiService: resolvedAiService,
+    telegramClient,
+    approvalExecutionService,
   };
 }

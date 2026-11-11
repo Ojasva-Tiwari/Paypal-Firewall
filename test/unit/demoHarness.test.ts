@@ -32,6 +32,7 @@ import { Repositories } from '../../src/db/repositories.js';
 import { hashApiKey } from '../../src/mcp/auth.js';
 import { hashOwnerPassphrase } from '../../src/auth/owner.js';
 import { toMinorUnits } from '../../src/core/money.js';
+import { resetConfig } from '../../src/config/index.js';
 import type { PayPalOrdersService, PayPalOrderResult } from '../../src/paypal/orders.js';
 import {
   seedDemoDatabase,
@@ -594,6 +595,68 @@ describe('M3 Batch 3: Demo Harness (M3-T6) & Scripted Honest Agent (M3-T7)', () 
 
       // Check log contains guidance on PayPal sandbox onboarding
       expect(logs.some((l) => l.includes('vault:onboard'))).toBe(true);
+    });
+
+    it('isolates injected runtime from localhost:3000 healthz probes and ambient env overrides', async () => {
+      const seed = seedDemoDatabase(db, { repos });
+      const prevMcpUrl = process.env.MCP_SERVER_URL;
+      const prevDemoKey = process.env.DEMO_AGENT_API_KEY;
+      const prevClientId = process.env.CONNECTOR_ACME_CLIENT_ID;
+      const prevClientSecret = process.env.CONNECTOR_ACME_CLIENT_SECRET;
+      const originalFetch = globalThis.fetch;
+      const attemptedExternalUrls: string[] = [];
+
+      process.env.MCP_SERVER_URL = 'http://localhost:3999/mcp';
+      process.env.DEMO_AGENT_API_KEY = 'ambient-unrelated-demo-key';
+      process.env.CONNECTOR_ACME_CLIENT_ID = 'ambient-paypal-client-id';
+      process.env.CONNECTOR_ACME_CLIENT_SECRET = 'ambient-paypal-client-secret';
+      resetConfig();
+
+      globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (urlStr.startsWith('http://localhost:3000') || urlStr.startsWith('http://localhost:3999')) {
+          attemptedExternalUrls.push(urlStr);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return originalFetch(input, init);
+      }) as typeof fetch;
+
+      try {
+        const result = await runHonestAgent({
+          db,
+          repos,
+          rawApiKey: seed.rawApiKey,
+          logger: { log: () => {}, warn: () => {}, error: () => {} },
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.policyDecision).toBe('ALLOW');
+        expect(result.hasSandboxExecution).toBe(false);
+        expect(attemptedExternalUrls).toEqual([]);
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (prevMcpUrl === undefined) {
+          delete process.env.MCP_SERVER_URL;
+        } else {
+          process.env.MCP_SERVER_URL = prevMcpUrl;
+        }
+        if (prevDemoKey === undefined) {
+          delete process.env.DEMO_AGENT_API_KEY;
+        } else {
+          process.env.DEMO_AGENT_API_KEY = prevDemoKey;
+        }
+        if (prevClientId === undefined) {
+          delete process.env.CONNECTOR_ACME_CLIENT_ID;
+        } else {
+          process.env.CONNECTOR_ACME_CLIENT_ID = prevClientId;
+        }
+        if (prevClientSecret === undefined) {
+          delete process.env.CONNECTOR_ACME_CLIENT_SECRET;
+        } else {
+          process.env.CONNECTOR_ACME_CLIENT_SECRET = prevClientSecret;
+        }
+        resetConfig();
+      }
     });
   });
 });

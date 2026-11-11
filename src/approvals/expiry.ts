@@ -25,10 +25,16 @@ import type { Repositories } from '../db/repositories.js';
 import { createRepositories } from '../db/repositories.js';
 import type { AuditLogRow } from '../db/types.js';
 import {
-
   transitionPaymentRequest,
   writeAuditLogEntry,
+  writeAuditLogEntryIfChanged,
 } from '../core/stateMachine.js';
+import { formatMinorUnitsToDecimal } from '../core/money.js';
+import { sanitizePublicBaseUrl } from '../config/index.js';
+import {
+  formatPaymentExpiredMessage,
+  enqueuePaymentTerminalOutcome,
+} from '../telegram/notifications.js';
 import type { PayPalAuthorizationsService } from '../paypal/authorizations.js';
 import { AuthorizationError } from '../paypal/authorizations.js';
 
@@ -36,6 +42,9 @@ export interface ExpireHoldOptions {
   readonly repos?: Repositories;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly now?: Date;
+  readonly publicBaseUrl?: string;
+  readonly isProduction?: boolean;
+  readonly shouldContinue?: () => boolean;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -66,6 +75,8 @@ export interface HoldExpiryWorkerOptions {
   readonly repos?: Repositories;
   readonly authorizationsService?: PayPalAuthorizationsService;
   readonly intervalMs?: number; // default: 30_000 (30s canonical)
+  readonly publicBaseUrl?: string;
+  readonly isProduction?: boolean;
   readonly logger?: {
     info?: (msg: string, ...args: unknown[]) => void;
     warn?: (msg: string, ...args: unknown[]) => void;
@@ -182,6 +193,30 @@ export async function expirePaymentHold(
       }
     }
 
+    // Enqueue Telegram notification if owner is linked
+    const isProd = options?.isProduction ?? process.env.NODE_ENV === 'production';
+    const hasExplicitBaseUrl = Boolean(options && 'publicBaseUrl' in options);
+    const publicBaseUrl = hasExplicitBaseUrl
+      ? sanitizePublicBaseUrl(options?.publicBaseUrl, isProd)
+      : isProd
+        ? undefined
+        : sanitizePublicBaseUrl(process.env.PUBLIC_BASE_URL, isProd);
+    const vendorName = repos.vendors.getById(request.vendor_id)?.name ?? request.vendor_id;
+    const expiredText = formatPaymentExpiredMessage({
+      requestId,
+      amountDecimal: formatMinorUnitsToDecimal(request.amount_minor),
+      currency: request.currency,
+      vendorName,
+      publicBaseUrl,
+      isProduction: isProd,
+    });
+    enqueuePaymentTerminalOutcome(repos, {
+      eventType: 'PAYMENT_EXPIRED',
+      requestId,
+      dedupKey: `payment_expired:${requestId}`,
+      messageText: expiredText,
+    });
+
     return {
       success: true,
       actionTaken: 'EXPIRED' as const,
@@ -206,54 +241,120 @@ export async function expirePaymentHold(
   let finalVoidStatus: 'PENDING' | 'CONFIRMED' | 'FAILED' = claimResult.initialVoidStatus;
 
   if (authId && options?.authorizationsService) {
+    let voidRes: Awaited<ReturnType<PayPalAuthorizationsService['voidAuthorization']>> | undefined;
+    let voidError: unknown;
     try {
-      const voidRes = await options.authorizationsService.voidAuthorization({
+      voidRes = await options.authorizationsService.voidAuthorization({
         authorizationId: authId,
         requestId,
       });
+    } catch (err: unknown) {
+      voidError = err;
+    }
 
+    if (voidRes !== undefined) {
       if (voidRes.isVoided) {
         finalVoidStatus = 'CONFIRMED';
-        repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
-        const auditEntry = writeAuditLogEntry(db, repos, {
-          actor: 'system',
-          event: 'PAYPAL_VOID_RECONCILED',
-          requestId,
-          timestamp: nowIso,
-          payload: {
-            authorizationId: authId,
-            reason: 'Remote authorization void confirmed for expired hold',
-            remote_void_status: 'CONFIRMED',
-          },
+        const auditEntry = runInTransaction(db, () => {
+          const latest = repos.paymentRequests.getById(requestId);
+          if (!latest || latest.remote_void_status === 'CONFIRMED') {
+            return undefined;
+          }
+          repos.paymentRequests.updateRemoteVoidStatus(requestId, 'CONFIRMED', nowIso);
+          return writeAuditLogEntry(db, repos, {
+            actor: 'system',
+            event: 'PAYPAL_VOID_RECONCILED',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              authorizationId: authId,
+              reason: 'Remote authorization void confirmed for expired hold',
+              remote_void_status: 'CONFIRMED',
+            },
+          });
         });
-        claimResult.auditEntries.push(auditEntry);
+        if (auditEntry) {
+          claimResult.auditEntries.push(auditEntry);
+        }
+      } else {
+        finalVoidStatus = 'PENDING';
+        const auditEntry = runInTransaction(db, () => {
+          const latest = repos.paymentRequests.getById(requestId);
+          if (!latest || latest.remote_void_status !== 'PENDING') {
+            return undefined;
+          }
+          return writeAuditLogEntryIfChanged(db, repos, {
+            actor: 'system',
+            event: 'PAYPAL_VOID_PENDING_RETRY',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              authorizationId: authId,
+              error: 'PayPal voidAuthorization returned unconfirmed status',
+              remote_void_status: 'PENDING',
+            },
+          });
+        });
+        if (auditEntry) {
+          claimResult.auditEntries.push(auditEntry);
+        }
       }
-    } catch (err: unknown) {
+    } else {
+      const errMsg = voidError instanceof Error ? voidError.message : String(voidError);
       const isDefinitive =
-        err instanceof AuthorizationError &&
-        (err.code === 'INVALID_REQUEST' || err.code === 'DECLINED');
+        voidError instanceof AuthorizationError &&
+        (voidError.code === 'INVALID_REQUEST' || voidError.code === 'DECLINED');
 
       if (isDefinitive) {
         finalVoidStatus = 'FAILED';
-        repos.paymentRequests.updateRemoteVoidStatus(requestId, 'FAILED', nowIso);
-        const auditEntry = writeAuditLogEntry(db, repos, {
-          actor: 'system',
-          event: 'PAYPAL_VOID_FAILED',
-          requestId,
-          timestamp: nowIso,
-          payload: {
-            authorizationId: authId,
-            error: err instanceof Error ? err.message : String(err),
-            remote_void_status: 'FAILED',
-          },
+        const auditEntry = runInTransaction(db, () => {
+          const latest = repos.paymentRequests.getById(requestId);
+          if (!latest || latest.remote_void_status === 'CONFIRMED' || latest.remote_void_status === 'FAILED') {
+            return undefined;
+          }
+          repos.paymentRequests.updateRemoteVoidStatus(requestId, 'FAILED', nowIso);
+          return writeAuditLogEntry(db, repos, {
+            actor: 'system',
+            event: 'PAYPAL_VOID_FAILED',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              authorizationId: authId,
+              error: errMsg,
+              remote_void_status: 'FAILED',
+            },
+          });
         });
-        claimResult.auditEntries.push(auditEntry);
+        if (auditEntry) {
+          claimResult.auditEntries.push(auditEntry);
+        }
       } else {
         // Transient error or network failure:
-        // Leave remote_void_status as 'PENDING'. ReconcilerWorker will recover it.
+        // Leave remote_void_status as 'PENDING' and record deduplicated retry telemetry.
+        finalVoidStatus = 'PENDING';
+        const auditEntry = runInTransaction(db, () => {
+          const latest = repos.paymentRequests.getById(requestId);
+          if (!latest || latest.remote_void_status !== 'PENDING') {
+            return undefined;
+          }
+          return writeAuditLogEntryIfChanged(db, repos, {
+            actor: 'system',
+            event: 'PAYPAL_VOID_PENDING_RETRY',
+            requestId,
+            timestamp: nowIso,
+            payload: {
+              authorizationId: authId,
+              error: errMsg,
+              remote_void_status: 'PENDING',
+            },
+          });
+        });
+        if (auditEntry) {
+          claimResult.auditEntries.push(auditEntry);
+        }
         options?.logger?.warn?.(
           `[HoldExpiry] Remote void call failed transiently for request '${requestId}', left as PENDING for reconciliation:`,
-          err
+          voidError
         );
       }
     }
@@ -287,6 +388,9 @@ export async function expireStaleHolds(
   let totalNoOp = 0;
 
   for (const candidate of candidates) {
+    if (options?.shouldContinue && !options.shouldContinue()) {
+      break;
+    }
     try {
       const result = await expirePaymentHold(db, candidate.id, options);
       results.push(result);
@@ -324,7 +428,8 @@ export class HoldExpiryWorker {
   private readonly intervalMs: number;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
-  private isTickInProgress = false;
+  private stopped = false;
+  private activeTickPromise: Promise<ExpireStaleHoldsBatchResult> | null = null;
 
   constructor(options: HoldExpiryWorkerOptions) {
     this.db = options.db;
@@ -337,10 +442,15 @@ export class HoldExpiryWorker {
     return this.running;
   }
 
+  public getIntervalMs(): number {
+    return this.intervalMs;
+  }
+
   public start(): void {
     if (this.running) {
       return;
     }
+    this.stopped = false;
     this.running = true;
 
     this.timer = setInterval(() => {
@@ -355,32 +465,52 @@ export class HoldExpiryWorker {
     this.options.logger?.info?.(`[HoldExpiryWorker] Started background job with interval ${this.intervalMs}ms`);
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
+    this.running = false;
+    this.stopped = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
-    this.running = false;
+    if (this.activeTickPromise) {
+      try {
+        await this.activeTickPromise;
+      } catch {
+        // Tick errors are handled and logged inside tick()
+      }
+    }
     this.options.logger?.info?.('[HoldExpiryWorker] Stopped background job');
   }
 
   public async tick(): Promise<ExpireStaleHoldsBatchResult> {
-    if (this.isTickInProgress) {
+    if (this.stopped || this.activeTickPromise) {
       return { totalDiscovered: 0, totalExpired: 0, totalNoOp: 0, results: [] };
     }
 
-    this.isTickInProgress = true;
+    const tickPromise = this.runTick();
+    this.activeTickPromise = tickPromise;
+    try {
+      return await tickPromise;
+    } finally {
+      if (this.activeTickPromise === tickPromise) {
+        this.activeTickPromise = null;
+      }
+    }
+  }
+
+  private async runTick(): Promise<ExpireStaleHoldsBatchResult> {
     try {
       return await expireStaleHolds(this.db, {
         repos: this.options.repos,
         authorizationsService: this.options.authorizationsService,
+        ...('publicBaseUrl' in this.options ? { publicBaseUrl: this.options.publicBaseUrl } : {}),
+        ...('isProduction' in this.options ? { isProduction: this.options.isProduction } : {}),
+        shouldContinue: () => !this.stopped,
         logger: this.options.logger,
       });
     } catch (err: unknown) {
       this.options.logger?.error?.('[HoldExpiryWorker] Error in expiry tick:', err);
       return { totalDiscovered: 0, totalExpired: 0, totalNoOp: 0, results: [] };
-    } finally {
-      this.isTickInProgress = false;
     }
   }
 }

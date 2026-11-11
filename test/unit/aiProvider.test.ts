@@ -18,6 +18,7 @@ import { Repositories } from '../../src/db/repositories.js';
 import {
   AiConfigurationError,
   AiTimeoutError,
+  AiCancelledError,
   AiRateLimitError,
   AiProviderError,
   AiSchemaError,
@@ -31,9 +32,13 @@ import {
 } from '../../src/ai/cache.js';
 import { AiRateLimiter } from '../../src/ai/rateLimiter.js';
 import { MockAiProvider } from '../../src/ai/mockProvider.js';
-import { GeminiProvider } from '../../src/ai/geminiProvider.js';
+import { GeminiProvider, DEFAULT_GEMINI_TIMEOUT_MS } from '../../src/ai/geminiProvider.js';
 import { AiService } from '../../src/ai/service.js';
 import { createAiProvider, createAiService } from '../../src/ai/index.js';
+import { AiRiskExplanationSchema } from '../../src/ai/riskExplainer.js';
+import { AiInjectionClassificationSchema } from '../../src/ai/injectionDetector.js';
+import { AiPolicyDraftOutputSchema } from '../../src/ai/policyDrafter.js';
+import { LiveAgentStepSchema } from '../../demo/liveAgent.js';
 
 // Sample structured risk schema for validation testing
 const RiskAnalysisSchema = z.object({
@@ -53,6 +58,8 @@ describe('M5-T1: AI Provider Architecture', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
     db.close();
     vi.restoreAllMocks();
   });
@@ -435,6 +442,299 @@ describe('M5-T1: AI Provider Architecture', () => {
       expect(caughtError!.message).not.toContain(apiKey);
       expect(caughtError!.message).toContain('[REDACTED_GEMINI_KEY]');
     });
+
+    it('transmits responseJsonSchema without $schema for all four PayGuard structured schemas and omits it for generateText', async () => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+
+      const cases: Array<{
+        name: string;
+        schema: z.ZodType<unknown>;
+        sampleOutput: unknown;
+      }> = [
+        {
+          name: 'AiRiskExplanationSchema',
+          schema: AiRiskExplanationSchema,
+          sampleOutput: {
+            summary: 'Payment triggers hold due to unverified vendor.',
+            suspicious_phrases: ['urgent override'],
+            risk_level: 'MEDIUM',
+          },
+        },
+        {
+          name: 'AiInjectionClassificationSchema',
+          schema: AiInjectionClassificationSchema,
+          sampleOutput: {
+            is_injection: true,
+            confidence: 'HIGH',
+            attack_categories: ['INSTRUCTION_OVERRIDE'],
+            explanation: 'Invoice contains explicit directive to override amount.',
+          },
+        },
+        {
+          name: 'AiPolicyDraftOutputSchema',
+          schema: AiPolicyDraftOutputSchema,
+          sampleOutput: {
+            proposed_rules: {
+              auto_limit_minor: 2500,
+              currency_allowlist: ['USD', 'EUR'],
+            },
+            explanation: 'Raised auto-approve limit to $25 and added EUR.',
+            unsupported_requests: [],
+          },
+        },
+        {
+          name: 'LiveAgentStepSchema',
+          schema: LiveAgentStepSchema,
+          sampleOutput: {
+            action_reason: 'Check registered vendors first.',
+            tool: 'list_vendors',
+            arguments: {},
+          },
+        },
+      ];
+
+      let caseIdx = -1;
+      const mockFetch: typeof fetch = vi.fn().mockImplementation(async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        capturedBodies.push(body);
+
+        if (caseIdx === -1) {
+          return new Response(
+            JSON.stringify({
+              candidates: [{ content: { parts: [{ text: 'Plain text output' }] } }],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const currentCase = cases[caseIdx]!;
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              { content: { parts: [{ text: JSON.stringify(currentCase.sampleOutput) }] } },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      const gemini = new GeminiProvider({
+        apiKey: 'test-key',
+        fetchFn: mockFetch,
+      });
+
+      // Plain text call should NOT set responseMimeType or responseJsonSchema
+      await gemini.generateText({ kind: 'test', prompt: 'Hello' });
+      const textGenConfig = capturedBodies[0]!.generationConfig as Record<string, unknown>;
+      expect(textGenConfig.responseMimeType).toBeUndefined();
+      expect(textGenConfig.responseJsonSchema).toBeUndefined();
+
+      for (let i = 0; i < cases.length; i++) {
+        caseIdx = i;
+        const testCase = cases[i]!;
+        const result = await gemini.generateStructured(
+          { kind: testCase.name, prompt: `Run ${testCase.name}` },
+          testCase.schema
+        );
+        expect(result.data).toEqual(testCase.sampleOutput);
+
+        const body = capturedBodies[i + 1]!;
+        const genConfig = body.generationConfig as Record<string, unknown>;
+        expect(genConfig.responseMimeType).toBe('application/json');
+        expect(genConfig.responseJsonSchema).toBeDefined();
+
+        const jsonSchema = genConfig.responseJsonSchema as Record<string, unknown>;
+        expect(jsonSchema.$schema).toBeUndefined();
+        expect(jsonSchema.type).toBe('object');
+        expect(jsonSchema.properties).toBeDefined();
+      }
+    });
+
+    it('enforces 25-second bounded default timeout (not 10s)', async () => {
+      vi.useFakeTimers();
+
+      const mockFetch: typeof fetch = vi.fn().mockImplementation(async (_url, init) => {
+        return await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException('The operation was aborted', 'AbortError'));
+            return;
+          }
+          signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('The operation was aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      });
+
+      const gemini = new GeminiProvider({
+        apiKey: 'test-key',
+        fetchFn: mockFetch,
+      });
+
+      expect(DEFAULT_GEMINI_TIMEOUT_MS).toBe(25_000);
+
+      let settled = false;
+      const promise = gemini.generateText({ kind: 'test', prompt: 'slow call' }).then(
+        () => {
+          settled = true;
+          return 'ok';
+        },
+        (err: unknown) => {
+          settled = true;
+          throw err;
+        }
+      );
+
+      // Attach assertion handler before advancing timers to avoid unhandled rejection warnings
+      const assertion = expect(promise).rejects.toMatchObject({
+        name: 'AiTimeoutError',
+        timeoutMs: 25_000,
+      });
+
+      // Advance past old 10s timeout -> must still be pending
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(settled).toBe(false);
+
+      // Advance remaining 10s to reach 25,000ms -> must reject with 25000ms AiTimeoutError
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(settled).toBe(true);
+      await assertion;
+    });
+
+    it('preserves first attempt sanitized error when retry subsequently times out without exposing credentials', async () => {
+      vi.useFakeTimers();
+      const apiKey = 'secret-gemini-retry-key-999';
+      let attempt = 0;
+
+      const mockFetch: typeof fetch = vi.fn().mockImplementation(async (_url, init) => {
+        attempt++;
+        if (attempt === 1) {
+          return new Response(
+            JSON.stringify({
+              error: { message: `High demand temporary outage for key ${apiKey}` },
+            }),
+            { status: 503 }
+          );
+        }
+
+        // Second attempt hangs until internal 25s timeout aborts it
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('The operation was aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      });
+
+      const gemini = new GeminiProvider({
+        apiKey,
+        maxRetries: 1,
+        fetchFn: mockFetch,
+      });
+
+      const promise = gemini.generateText({ kind: 'test', prompt: '503 then timeout' });
+      const assertion = promise.catch((err: unknown) => err);
+
+      // Flush attempt 1 (503) + backoff (~700ms max) + attempt 2 timeout (25,000ms)
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      const caught = (await assertion) as AiTimeoutError;
+      expect(attempt).toBe(2);
+      expect(caught).toBeInstanceOf(AiTimeoutError);
+      expect(caught.timeoutMs).toBe(25_000);
+      expect(caught.previousErrorMessage).toContain('HTTP 503');
+      expect(caught.previousErrorMessage).toContain('[REDACTED_GEMINI_KEY]');
+      expect(caught.previousErrorMessage).not.toContain(apiKey);
+      expect(caught.message).toContain('HTTP 503');
+      expect(caught.message).toContain('[REDACTED_GEMINI_KEY]');
+      expect(caught.message).not.toContain(apiKey);
+    });
+
+    it('distinguishes caller AbortSignal cancellation from internal timeout and never retries', async () => {
+      let fetchCalls = 0;
+      const preAbortedController = new AbortController();
+      preAbortedController.abort();
+
+      const mockFetch: typeof fetch = vi.fn().mockImplementation(async (_url, init) => {
+        fetchCalls++;
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      });
+
+      const gemini = new GeminiProvider({
+        apiKey: 'test-key',
+        timeoutMs: 25_000,
+        maxRetries: 1,
+        fetchFn: mockFetch,
+      });
+
+      // Case 1: Pre-aborted signal -> rejects immediately with AiCancelledError, zero fetch calls
+      let preAbortedErr: unknown;
+      try {
+        await gemini.generateText({ kind: 'test', prompt: 'pre-aborted' }, preAbortedController.signal);
+        expect.unreachable('Expected AiCancelledError');
+      } catch (err: unknown) {
+        preAbortedErr = err;
+      }
+      expect(preAbortedErr).toBeInstanceOf(AiCancelledError);
+      expect(preAbortedErr).not.toBeInstanceOf(AiTimeoutError);
+      expect(fetchCalls).toBe(0);
+
+      // Case 2: In-flight cancellation -> rejects with AiCancelledError, does not retry
+      const inflightController = new AbortController();
+      const promise = gemini.generateText({ kind: 'test', prompt: 'inflight' }, inflightController.signal);
+      inflightController.abort();
+
+      let inflightErr: unknown;
+      try {
+        await promise;
+        expect.unreachable('Expected AiCancelledError');
+      } catch (err: unknown) {
+        inflightErr = err;
+      }
+      expect(inflightErr).toBeInstanceOf(AiCancelledError);
+      expect(inflightErr).not.toBeInstanceOf(AiTimeoutError);
+      expect(fetchCalls).toBe(1);
+
+      // Case 3: Cancellation during retry backoff after HTTP 503 -> cancels immediately before attempt 2
+      vi.useFakeTimers();
+      let retryCalls = 0;
+      const backoffFetch: typeof fetch = vi.fn().mockImplementation(async () => {
+        retryCalls++;
+        return new Response(JSON.stringify({ error: { message: 'Temporary 503' } }), { status: 503 });
+      });
+
+      const geminiRetry = new GeminiProvider({
+        apiKey: 'test-key',
+        timeoutMs: 25_000,
+        maxRetries: 1,
+        fetchFn: backoffFetch,
+      });
+
+      const backoffController = new AbortController();
+      const retryPromise = geminiRetry.generateText(
+        { kind: 'test', prompt: 'abort in backoff' },
+        backoffController.signal
+      );
+      const retryResult = retryPromise.catch((err: unknown) => err);
+
+      await vi.advanceTimersByTimeAsync(100);
+      backoffController.abort();
+
+      const backoffErr = await retryResult;
+      expect(backoffErr).toBeInstanceOf(AiCancelledError);
+      expect(backoffErr).not.toBeInstanceOf(AiTimeoutError);
+      expect(retryCalls).toBe(1);
+    });
   });
 
   // ==========================================================================
@@ -596,7 +896,21 @@ describe('M5-T1: AI Provider Architecture', () => {
       }).toThrow(AiConfigurationError);
     });
 
-    it('creates GeminiProvider with canonical default model (gemini-3.8-flash) when aiModel is omitted', () => {
+    it('creates GeminiProvider with canonical default model (gemini-3.5-flash-lite) and 25s timeout when aiModel is omitted', async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation(async (_url, init) => {
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('Aborted', 'AbortError')),
+              { once: true }
+            );
+          });
+        })
+      );
+
       const provider = createAiProvider({
         aiProvider: 'gemini',
         aiModel: '',
@@ -604,8 +918,15 @@ describe('M5-T1: AI Provider Architecture', () => {
       });
 
       expect(provider.kind).toBe('gemini');
-      expect(provider.modelName).toBe('gemini-3.8-flash');
+      expect(provider.modelName).toBe('gemini-3.5-flash-lite');
       expect(provider.modelName).toBe(DEFAULT_GEMINI_MODEL);
+
+      const call = provider.generateText({ kind: 'test', prompt: 'timeout check' });
+      const settled = call.catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(25_000);
+      const err = await settled;
+      expect(err).toBeInstanceOf(AiTimeoutError);
+      expect((err as AiTimeoutError).timeoutMs).toBe(25_000);
     });
 
     it('creates GeminiProvider when aiProvider is gemini with user-configured custom model', () => {
@@ -624,7 +945,7 @@ describe('M5-T1: AI Provider Architecture', () => {
         apiKey: 'test-key',
       });
 
-      expect(provider.modelName).toBe('gemini-3.8-flash');
+      expect(provider.modelName).toBe('gemini-3.5-flash-lite');
       expect(provider.modelName).toBe(DEFAULT_GEMINI_MODEL);
     });
 

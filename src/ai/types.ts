@@ -36,11 +36,26 @@ export class AiConfigurationError extends AiError {
 
 export class AiTimeoutError extends AiError {
   public readonly timeoutMs: number;
+  public readonly previousErrorMessage?: string;
 
-  constructor(timeoutMs: number) {
-    super(`AI provider request timed out after ${timeoutMs}ms`, 'TIMEOUT');
+  constructor(timeoutMs: number, previousErrorMessage?: string) {
+    const baseMessage = `AI provider request timed out after ${timeoutMs}ms`;
+    const message = previousErrorMessage
+      ? `${baseMessage} (previous attempt failed: ${previousErrorMessage})`
+      : baseMessage;
+    super(message, 'TIMEOUT');
     this.name = 'AiTimeoutError';
     this.timeoutMs = timeoutMs;
+    if (previousErrorMessage) {
+      this.previousErrorMessage = previousErrorMessage;
+    }
+  }
+}
+
+export class AiCancelledError extends AiError {
+  constructor(message = 'AI provider request was cancelled by caller') {
+    super(message, 'CANCELLED');
+    this.name = 'AiCancelledError';
   }
 }
 
@@ -89,9 +104,9 @@ export type AiRunStatus = 'SUCCESS' | 'RATE_LIMITED' | 'TIMEOUT' | 'ERROR';
 /**
  * Canonical default Gemini model.
  * Note: gemini-1.5-flash was decommissioned by Google on September 29, 2025.
- * PayGuard defaults to the modern gemini-3.8-flash for fast, structured risk scanning.
+ * PayGuard defaults to gemini-3.5-flash-lite for low-latency, structured risk scanning and policy evaluation.
  */
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 
 /**
  * Options passed to generateText or generateStructured.

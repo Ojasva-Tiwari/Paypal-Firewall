@@ -126,6 +126,49 @@ This document records the foundational decisions made for PayGuard. As spikes ar
   6. Scanning runs before database write transactions to avoid holding SQLite locks during external AI provider calls.
 - **Consequences**: Zero new dependencies added (Hard Rule 10). Guaranteed deterministic safety baseline, fail-safe degradation on AI outages, and strict protection against prompt-injection payment tampering.
 
+### D18: Shared `ApprovalExecutionService` & Order/Capture vs. Void Boundary
+- **Date**: 2026-11-11
+- **Context**: Three owner/system approval channels (Dashboard REST `/api/requests/:id/*`, Web approval links `/a/:token/*`, and Telegram inline buttons) plus `HoldExpiryWorker` needed identical transactional single-use token invalidation, snapshot hash checks, and idempotent remote settlement without duplicating money-path logic.
+- **Decision**: Centralize approval/void orchestration in `src/approvals/service.ts` (`ApprovalExecutionService`). All payment captures delegate through `executeDecision` (`src/core/executeDecision.ts`), which remains the sole call site for PayPal `createOrder` and `captureAuthorization`. Authorization voids (non-money-disbursing releases of holds) route through `ApprovalExecutionService` / `HoldExpiryWorker` / `ReconcilerWorker` -> `PayPalAuthorizationsService.voidAuthorization`.
+- **Consequences**: Zero duplicated approval security logic across channels; cross-channel replay attacks and concurrent double-captures are blocked atomically.
+
+### D19: PayPal `Prefer: return=representation` & Remote `orderId` Preservation (Task C2)
+- **Date**: 2026-11-11
+- **Context**: Live Sandbox testing (Task C1) revealed that omitting `Prefer: return=representation` on `POST /v2/checkout/orders` causes PayPal to return a minimal payload lacking top-level `intent`, `purchase_units[0].amount`, and `custom_id`, and throwing before persisting `order.id` left local rows stuck in `EXECUTION_AMBIGUOUS` with `paypal_order_id = null`.
+- **Decision**:
+  1. Send `Prefer: return=representation` on `PayPalOrdersService.createOrder`.
+  2. Support full and reduced PayPal order representations in `parseOrderResponse` while failing closed if financial identity/amount cannot be established reliably.
+  3. Attach sanitized `OrderError.orderId` whenever PayPal returns an HTTP success response containing an `id`, so `executeDecision` persists `paypal_order_id` on `AUTO_EXECUTING` / `HELD` and `ReconcilerWorker` can recover state cleanly (`C2-T5A`/`C2-T5B`).
+- **Consequences**: Prevents unrecoverable orphaned remote orders/holds while preserving fail-closed money safety.
+
+### D20: Persistent `owner_sessions` (`012`) & Scoped Browser Form CSRF on `/a/:token`
+- **Date**: 2026-11-11
+- **Context**: In-memory owner sessions do not survive restarts, and browser GET/form-POST flows on `/a/:token` failed due to `*/*` Accept negotiation, missing `express.urlencoded()` parsing, header-only CSRF enforcement, and CSP-blocked inline JS.
+- **Decision**:
+  1. Store owner sessions as SHA-256 key digests in SQLite `owner_sessions` (`012_owner_sessions`) with fail-closed `503` handling on DB errors.
+  2. Scope `express.urlencoded({ extended: false, limit: '16kb' })`, `htmlErrorResponses: true`, and `allowFormBodyCsrf: true` strictly to the `/a` browser approval router (accepting hidden `_csrf` form fields only for `application/x-www-form-urlencoded` requests when `x-csrf-token` header is absent), remove inline JS `onsubmit`, and format currency symbols explicitly from `currency`. Keep `/api/*` strictly header-CSRF (`x-csrf-token`).
+- **Consequences**: Standard browser GET/POST approvals on `/a/:token` function under `default-src 'none'` CSP without relaxing CSRF protections on `/api/*`.
+
+### D21: Server-Side `MAX_HARD_CAP_MINOR` Ceiling Enforcement
+- **Date**: 2026-11-11
+- **Context**: `MAX_HARD_CAP_MINOR` was parsed into config but left unenforced during manual policy creation and AI policy drafting/activation.
+- **Decision**: Enforce `validateHardCapWithinCeiling()` (`src/config/index.ts`) across `POST /api/policies`, `POST /api/policies/draft`, and proposal activation/reject endpoints (`src/api/owner.ts` & `src/ai/policyDrafter.ts`), ensuring `hard_cap_minor` never exceeds `config.maxHardCapMinor` even when inherited from base rules.
+- **Consequences**: Aligns runtime enforcement with configuration docs and prevents AI-drafted or manual policy escalation past operational bounds.
+
+### D22: Streamable HTTP (`/mcp`) Sole Supported MCP Transport (Deferring `stdio`)
+- **Date**: 2026-11-11
+- **Context**: Decision D9 initially envisioned both Streamable HTTP (`/mcp`) and local `stdio` transports. PayGuard's production server and demos standardize on HTTP bearer authentication and session-to-agent binding.
+- **Decision**: Defer local `stdio` transport post-submission and operate `/mcp` Streamable HTTP as the canonical supported MCP transport (`POST`/`GET`/`DELETE /mcp`), enforced by SHA-256 agent bearer tokens and per-session `agentId` checks.
+- **Consequences**: Eliminates unauthenticated local transport surface; any future `stdio` wrapper must explicitly bind an agent identity before activation.
+
+### D23: Deferred PayPal Toolkit Panel (`M5-T8`) & Targeted Console Masking
+- **Date**: 2026-11-11
+- **Context**: PLAN.md listed optional `@paypal/agent-toolkit` read-only reporting (`M5-T8` / `GET /api/paypal/activity`) and `pino` structured logging (`PLAN.md` §16).
+- **Decision**:
+  1. Defer `@paypal/agent-toolkit` integration to keep dependencies minimal (Hard Rule 10); `GET /api/paypal/activity` returns a safe `{ enabled: false, transactions: [] }` payload.
+  2. Standardize on native Node console logging with strict secret masking in HTTP/AI/MCP/audit layers rather than adding `pino` as a new dependency.
+- **Consequences**: Zero unnecessary dependencies added before submission; documented transparently as deferred/known limitations.
+
 ---
 
 ## Dependency Justification Log

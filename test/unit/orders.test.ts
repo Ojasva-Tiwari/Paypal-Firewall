@@ -710,4 +710,749 @@ describe('M2-T4: PayPal Orders API Wrapper', () => {
     expect(result.isAuthorized).toBe(true);
     expect(result.isCaptured).toBe(false);
   });
+
+  // ==========================================================================
+  // Task C2 Regression Tests: Prefer Header, Reduced Responses, OrderId Recovery
+  // ==========================================================================
+
+  it('18. createOrder sends Prefer: return=representation header for both CAPTURE and AUTHORIZE', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ord-pref-cap',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-pref-cap',
+            amount: { currency_code: 'USD', value: '5.00' },
+            payments: {
+              captures: [
+                { id: 'cap-pref-1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '5.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await ordersService.createOrder({
+      requestId: 'req-pref-cap',
+      amountMinor: toMinorUnits(500),
+      currency: 'USD',
+      intent: 'CAPTURE',
+      vaultTokenId: 'tok-pref',
+    });
+
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ord-pref-auth',
+        status: 'COMPLETED',
+        intent: 'AUTHORIZE',
+        purchase_units: [
+          {
+            custom_id: 'req-pref-auth',
+            amount: { currency_code: 'USD', value: '16.00' },
+            payments: {
+              authorizations: [
+                { id: 'auth-pref-1', status: 'CREATED', amount: { currency_code: 'USD', value: '16.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await ordersService.createOrder({
+      requestId: 'req-pref-auth',
+      amountMinor: toMinorUnits(1600),
+      currency: 'USD',
+      intent: 'AUTHORIZE',
+      vaultTokenId: 'tok-pref',
+    });
+
+    const capHeaders = mockFetch.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    const authHeaders = mockFetch.mock.calls[1]?.[1]?.headers as Record<string, string>;
+    expect(capHeaders['Prefer']).toBe('return=representation');
+    expect(authHeaders['Prefer']).toBe('return=representation');
+  });
+
+  it('19. createOrder parses reduced PayPal CAPTURE response recovering intent, amount, and custom_id from captures[0]', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: '1P305303VU528854A',
+        status: 'COMPLETED',
+        // intent omitted (return=minimal behavior)
+        purchase_units: [
+          {
+            reference_id: 'default',
+            // custom_id and amount omitted at purchase_unit level
+            payments: {
+              captures: [
+                {
+                  id: '3BH91280H60332216',
+                  status: 'COMPLETED',
+                  custom_id: 'req-minimal-cap',
+                  amount: { currency_code: 'USD', value: '1.00' },
+                  final_capture: true,
+                },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+
+    const result = await ordersService.createOrder({
+      requestId: 'req-minimal-cap',
+      amountMinor: toMinorUnits(100),
+      currency: 'USD',
+      intent: 'CAPTURE',
+      vaultTokenId: 'tok-min',
+    });
+
+    expect(result.id).toBe('1P305303VU528854A');
+    expect(result.intent).toBe('CAPTURE');
+    expect(result.customId).toBe('req-minimal-cap');
+    expect(result.amountMinor).toBe(toMinorUnits(100));
+    expect(result.currency).toBe('USD');
+    expect(result.isCaptured).toBe(true);
+    expect(result.isAuthorized).toBe(false);
+    expect(result.capture?.id).toBe('3BH91280H60332216');
+  });
+
+  it('20. createOrder parses reduced PayPal AUTHORIZE response recovering intent, amount, and custom_id from authorizations[0]', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: '5UP02354SE6008326',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            reference_id: 'default',
+            payments: {
+              authorizations: [
+                {
+                  id: 'AUTH-MIN-1',
+                  status: 'CREATED',
+                  custom_id: 'req-minimal-auth',
+                  amount: { currency_code: 'USD', value: '16.00' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+
+    const result = await ordersService.createOrder({
+      requestId: 'req-minimal-auth',
+      amountMinor: toMinorUnits(1600),
+      currency: 'USD',
+      intent: 'AUTHORIZE',
+      vaultTokenId: 'tok-min',
+    });
+
+    expect(result.id).toBe('5UP02354SE6008326');
+    expect(result.intent).toBe('AUTHORIZE');
+    expect(result.customId).toBe('req-minimal-auth');
+    expect(result.amountMinor).toBe(toMinorUnits(1600));
+    expect(result.currency).toBe('USD');
+    expect(result.isAuthorized).toBe(true);
+    expect(result.isCaptured).toBe(false);
+    expect(result.authorization?.id).toBe('AUTH-MIN-1');
+  });
+
+  it('21. Reduced CAPTURE response with PENDING capture still reports isCaptured=false', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-MIN-PEND',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            payments: {
+              captures: [
+                {
+                  id: 'CAP-MIN-PEND',
+                  status: 'PENDING',
+                  custom_id: 'req-min-pend',
+                  amount: { currency_code: 'USD', value: '5.00' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+
+    const result = await ordersService.createOrder({
+      requestId: 'req-min-pend',
+      amountMinor: toMinorUnits(500),
+      currency: 'USD',
+      intent: 'CAPTURE',
+      vaultTokenId: 'tok-min',
+    });
+
+    expect(result.intent).toBe('CAPTURE');
+    expect(result.isCaptured).toBe(false);
+    expect(result.capture?.status).toBe('PENDING');
+  });
+
+  it('22. Fails closed and attaches sanitized orderId when monetary fields are missing in both purchase_unit and payment object', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-NO-MONEY-1',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-no-money',
+            // pu.amount omitted, and no payments.captures fallback
+          },
+        ],
+      }, 201, 'dbg-no-money')
+    );
+
+    let caught: OrderError | undefined;
+    try {
+      await ordersService.createOrder({
+        requestId: 'req-no-money',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      });
+    } catch (err) {
+      if (err instanceof OrderError) caught = err;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught?.code).toBe('INVALID_ORDER_RESPONSE');
+    expect(caught?.orderId).toBe('ORD-NO-MONEY-1');
+    expect(caught?.debugId).toBe('dbg-no-money');
+  });
+
+  it('23. Fails closed and preserves orderId on reduced response missing custom_id or mismatched monetary fields', async () => {
+    // Missing custom_id everywhere on createOrder
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-NO-CUSTOM',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            payments: {
+              captures: [
+                { id: 'cap-1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '5.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-expected',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'CUSTOM_ID_MISMATCH',
+      orderId: 'ORD-NO-CUSTOM',
+    });
+
+    // Monetary mismatch in recovered capture amount
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-MIN-MISMATCH',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            payments: {
+              captures: [
+                {
+                  id: 'cap-2',
+                  status: 'COMPLETED',
+                  custom_id: 'req-min-amt',
+                  amount: { currency_code: 'USD', value: '9.99' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-min-amt',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'AMOUNT_MISMATCH',
+      orderId: 'ORD-MIN-MISMATCH',
+    });
+  });
+
+  it('24. Refuses ambiguous or mismatched intent structure on reduced responses and preserves orderId', async () => {
+    // Explicit intent mismatch
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-EXPLICIT-MISMATCH',
+        status: 'COMPLETED',
+        intent: 'AUTHORIZE',
+        purchase_units: [{ custom_id: 'req-1', amount: { currency_code: 'USD', value: '5.00' } }],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-1',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INTENT_MISMATCH', orderId: 'ORD-EXPLICIT-MISMATCH' });
+
+    // Reduced CAPTURE request receiving authorizations instead of captures
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-STRUCT-MISMATCH',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            payments: {
+              authorizations: [
+                { id: 'auth-1', status: 'CREATED', custom_id: 'req-2', amount: { currency_code: 'USD', value: '5.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-2',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INTENT_MISMATCH', orderId: 'ORD-STRUCT-MISMATCH' });
+
+    // Reduced response with omitted intent AND empty payments fails closed (never guesses)
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-NO-PAYMENTS',
+        status: 'PAYER_ACTION_REQUIRED',
+        purchase_units: [
+          { custom_id: 'req-3', amount: { currency_code: 'USD', value: '5.00' } },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-3',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ORDER_RESPONSE', orderId: 'ORD-NO-PAYMENTS' });
+
+    // getOrder() must never infer omitted intent even if captures are present
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-GET-NO-INTENT',
+        status: 'COMPLETED',
+        purchase_units: [
+          {
+            custom_id: 'req-get',
+            amount: { currency_code: 'USD', value: '5.00' },
+            payments: {
+              captures: [
+                { id: 'cap-get', status: 'COMPLETED', amount: { currency_code: 'USD', value: '5.00' } },
+              ],
+            },
+          },
+        ],
+      }, 200)
+    );
+    await expect(ordersService.getOrder('ORD-GET-NO-INTENT')).rejects.toMatchObject({
+      code: 'INVALID_ORDER_RESPONSE',
+      orderId: 'ORD-GET-NO-INTENT',
+    });
+  });
+
+  it('25. Preserves sanitized orderId on 2xx validation failures and strips unsafe id values', async () => {
+    // Missing purchase_units preserves sanitized orderId
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: '  ORD-PRESERVED-1  ',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+      }, 201, 'dbg-pres-1')
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-p1',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'INVALID_ORDER_RESPONSE',
+      orderId: 'ORD-PRESERVED-1',
+      debugId: 'dbg-pres-1',
+    });
+
+    // Malformed decimal string wraps MoneyError preserving orderId
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-BAD-DECIMAL',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          { custom_id: 'req-p2', amount: { currency_code: 'USD', value: 'NaN' } },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-p2',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'INVALID_ORDER_RESPONSE',
+      orderId: 'ORD-BAD-DECIMAL',
+    });
+
+    // Tainted id containing whitespace / secret text is rejected without attaching unsafe orderId
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'Bearer super-secret-token',
+        status: 'COMPLETED',
+      }, 201)
+    );
+    let taintedErr: OrderError | undefined;
+    try {
+      await ordersService.createOrder({
+        requestId: 'req-tainted',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      });
+    } catch (err) {
+      if (err instanceof OrderError) taintedErr = err;
+    }
+    expect(taintedErr).toBeDefined();
+    expect(taintedErr?.code).toBe('INVALID_ORDER_RESPONSE');
+    expect(taintedErr?.orderId).toBeUndefined();
+    expect(taintedErr?.message).not.toContain('super-secret-token');
+  });
+
+  it('26. Parses full representation order missing optional top-level fields (links, timestamps, payer, payment_source)', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-OPT-OMITTED',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-opt-omitted',
+            amount: { currency_code: 'USD', value: '7.25' },
+            payments: {
+              captures: [
+                {
+                  id: 'CAP-OPT-1',
+                  status: 'COMPLETED',
+                  amount: { currency_code: 'USD', value: '7.25' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+
+    const created = await ordersService.createOrder({
+      requestId: 'req-opt-omitted',
+      amountMinor: toMinorUnits(725),
+      currency: 'USD',
+      intent: 'CAPTURE',
+      vaultTokenId: 'tok-opt',
+    });
+
+    expect(created.id).toBe('ORD-OPT-OMITTED');
+    expect(created.links).toEqual([]);
+    expect(created.isCaptured).toBe(true);
+    expect(created.capture?.id).toBe('CAP-OPT-1');
+
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-OPT-OMITTED',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-opt-omitted',
+            amount: { currency_code: 'USD', value: '7.25' },
+            payments: {
+              captures: [
+                {
+                  id: 'CAP-OPT-1',
+                  status: 'COMPLETED',
+                  amount: { currency_code: 'USD', value: '7.25' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 200)
+    );
+
+    const fetched = await ordersService.getOrder('ORD-OPT-OMITTED');
+    expect(fetched.links).toEqual([]);
+    expect(fetched.amountMinor).toBe(toMinorUnits(725));
+    expect(fetched.isCaptured).toBe(true);
+  });
+
+  it('27. Fails closed preserving orderId when purchase_unit.custom_id conflicts with payment custom_id', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-CUSTOM-CONFLICT',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-expected',
+            amount: { currency_code: 'USD', value: '5.00' },
+            payments: {
+              captures: [
+                {
+                  id: 'CAP-CONFLICT',
+                  status: 'COMPLETED',
+                  custom_id: 'req-different',
+                  amount: { currency_code: 'USD', value: '5.00' },
+                },
+              ],
+            },
+          },
+        ],
+      }, 201, 'dbg-custom-conflict')
+    );
+
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-expected',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'CUSTOM_ID_MISMATCH',
+      orderId: 'ORD-CUSTOM-CONFLICT',
+      debugId: 'dbg-custom-conflict',
+    });
+  });
+
+  it('28. getOrder validates capture and authorization amounts against purchase_unit amount and allows captured AUTHORIZE order', async () => {
+    // Capture amount differs from purchase_unit amount
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-GET-CAP-MISMATCH',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-get-1',
+            amount: { currency_code: 'USD', value: '25.00' },
+            payments: {
+              captures: [
+                { id: 'CAP-PARTIAL', status: 'COMPLETED', amount: { currency_code: 'USD', value: '10.00' } },
+              ],
+            },
+          },
+        ],
+      }, 200)
+    );
+    await expect(ordersService.getOrder('ORD-GET-CAP-MISMATCH')).rejects.toMatchObject({
+      code: 'CAPTURE_AMOUNT_MISMATCH',
+      orderId: 'ORD-GET-CAP-MISMATCH',
+    });
+
+    // Authorization amount differs from purchase_unit amount
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-GET-AUTH-MISMATCH',
+        status: 'COMPLETED',
+        intent: 'AUTHORIZE',
+        purchase_units: [
+          {
+            custom_id: 'req-get-2',
+            amount: { currency_code: 'USD', value: '25.00' },
+            payments: {
+              authorizations: [
+                { id: 'AUTH-PARTIAL', status: 'CREATED', amount: { currency_code: 'USD', value: '10.00' } },
+              ],
+            },
+          },
+        ],
+      }, 200)
+    );
+    await expect(ordersService.getOrder('ORD-GET-AUTH-MISMATCH')).rejects.toMatchObject({
+      code: 'AUTHORIZATION_AMOUNT_MISMATCH',
+      orderId: 'ORD-GET-AUTH-MISMATCH',
+    });
+
+    // Post-capture AUTHORIZE order with single authorization + single matching capture succeeds on getOrder()
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-GET-AUTH-CAPTURED',
+        status: 'COMPLETED',
+        intent: 'AUTHORIZE',
+        purchase_units: [
+          {
+            custom_id: 'req-get-3',
+            amount: { currency_code: 'USD', value: '25.00' },
+            payments: {
+              authorizations: [
+                { id: 'AUTH-CAP-1', status: 'CAPTURED', amount: { currency_code: 'USD', value: '25.00' } },
+              ],
+              captures: [
+                { id: 'CAP-FROM-AUTH-1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '25.00' } },
+              ],
+            },
+          },
+        ],
+      }, 200)
+    );
+    const capturedAuthOrder = await ordersService.getOrder('ORD-GET-AUTH-CAPTURED');
+    expect(capturedAuthOrder.intent).toBe('AUTHORIZE');
+    expect(capturedAuthOrder.authorization?.id).toBe('AUTH-CAP-1');
+    expect(capturedAuthOrder.capture?.id).toBe('CAP-FROM-AUTH-1');
+    expect(capturedAuthOrder.isCaptured).toBe(false);
+    expect(capturedAuthOrder.isAuthorized).toBe(false);
+  });
+
+  it('29. Fails closed preserving orderId when response contains multiple purchase_units, authorizations, or captures', async () => {
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-MULTI-PU',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          { custom_id: 'req-m1', amount: { currency_code: 'USD', value: '5.00' } },
+          { custom_id: 'req-m2', amount: { currency_code: 'USD', value: '5.00' } },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-m1',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ORDER_RESPONSE', orderId: 'ORD-MULTI-PU' });
+
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-MULTI-AUTH',
+        status: 'COMPLETED',
+        intent: 'AUTHORIZE',
+        purchase_units: [
+          {
+            custom_id: 'req-ma',
+            amount: { currency_code: 'USD', value: '10.00' },
+            payments: {
+              authorizations: [
+                { id: 'AUTH-1', status: 'CREATED', amount: { currency_code: 'USD', value: '10.00' } },
+                { id: 'AUTH-2', status: 'CREATED', amount: { currency_code: 'USD', value: '10.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-ma',
+        amountMinor: toMinorUnits(1000),
+        currency: 'USD',
+        intent: 'AUTHORIZE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ORDER_RESPONSE', orderId: 'ORD-MULTI-AUTH' });
+
+    mockFetch.mockResolvedValueOnce(
+      createJsonResponse({
+        id: 'ORD-MULTI-CAP',
+        status: 'COMPLETED',
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            custom_id: 'req-mc',
+            amount: { currency_code: 'USD', value: '10.00' },
+            payments: {
+              captures: [
+                { id: 'CAP-1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '5.00' } },
+                { id: 'CAP-2', status: 'COMPLETED', amount: { currency_code: 'USD', value: '5.00' } },
+              ],
+            },
+          },
+        ],
+      }, 201)
+    );
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-mc',
+        amountMinor: toMinorUnits(1000),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ORDER_RESPONSE', orderId: 'ORD-MULTI-CAP' });
+  });
+
+  it('30. Preserves sanitized orderId even when internal parsing throws an unexpected non-OrderError exception', async () => {
+    const throwingPayload = {
+      id: '  ORD-INTERNAL-CRASH  ',
+      get status(): string {
+        throw new TypeError('Simulated unexpected parser property error');
+      },
+    };
+    const throwingResponse = {
+      ok: true,
+      status: 201,
+      headers: new Headers({
+        'content-type': 'application/json',
+        'paypal-debug-id': 'dbg-internal-crash',
+      }),
+      json: async () => throwingPayload,
+      text: async () => '',
+    } as unknown as Response;
+
+    mockFetch.mockResolvedValueOnce(throwingResponse);
+
+    await expect(
+      ordersService.createOrder({
+        requestId: 'req-crash',
+        amountMinor: toMinorUnits(500),
+        currency: 'USD',
+        intent: 'CAPTURE',
+        vaultTokenId: 'tok-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'INVALID_ORDER_RESPONSE',
+      orderId: 'ORD-INTERNAL-CRASH',
+      debugId: 'dbg-internal-crash',
+    });
+  });
 });

@@ -36,6 +36,7 @@ export interface OnboardWorkflowOptions {
   readonly connectorKey?: string;
   readonly setupOnly?: boolean;
   readonly confirmSetupTokenId?: string;
+  readonly replaceExisting?: boolean;
   readonly promptFn?: (query: string) => Promise<string>;
   readonly logger?: {
     log: (msg: string) => void;
@@ -50,6 +51,14 @@ export interface OnboardWorkflowResult {
   readonly approvalUrl?: string;
   readonly paymentTokenId?: string;
   readonly vaultTokenRowId?: string;
+  readonly replacedRowId?: string;
+  readonly error?: string;
+}
+
+export interface RevokeLocalTokenResult {
+  readonly success: boolean;
+  readonly revokedRowId?: string;
+  readonly maskedTokenId?: string;
   readonly error?: string;
 }
 
@@ -88,10 +97,10 @@ export async function runOnboardingWorkflow(
     return { success: false, error: errorMsg };
   }
 
-  // 3. Check if vendor already has a Vault token (prevent duplicate / replacement)
+  // 3. Check if vendor already has an active Vault token (prevent duplicate / silent replacement)
   const existingToken = options.repos.vendorVaultTokens.getByVendorId(vendorId);
-  if (existingToken) {
-    const errorMsg = `Vendor '${vendorId}' already has a vaulted token (row: ${existingToken.id}, token: ${maskTokenId(existingToken.vault_token_id)}). Token replacement is not supported by the canonical plan.`;
+  if (existingToken && !options.replaceExisting) {
+    const errorMsg = `Vendor '${vendorId}' already has a vaulted token (row: ${existingToken.id}, token: ${maskTokenId(existingToken.vault_token_id)}). Token replacement is not supported by default; pass --replace to revoke and replace.`;
     logger.warn(`[OnboardVault] Warning: ${errorMsg}`);
     return { success: false, error: errorMsg };
   }
@@ -135,7 +144,7 @@ export async function runOnboardingWorkflow(
   logger.log('\n================================================================');
   logger.log(' PayGuard Vault Sandbox Onboarding');
   logger.log('================================================================');
-  logger.log(` Setup Token ID : ${setupResult.id}`);
+  logger.log(` Setup Token ID : ${maskTokenId(setupResult.id)}`);
   logger.log(` Status         : ${setupResult.status}`);
   logger.log(' Action Required: Open the approval link below in your browser');
   logger.log(' ------------------------------------------------------------');
@@ -157,7 +166,7 @@ export async function runOnboardingWorkflow(
   await promptFn('Press [Enter] after completing buyer approval in the browser to continue... ');
 
   // 7. Confirm setup
-  logger.log(`\n[OnboardVault] Confirming setup token ${setupResult.id}...`);
+  logger.log(`\n[OnboardVault] Confirming setup token ${maskTokenId(setupResult.id)}...`);
   let paymentToken;
   try {
     paymentToken = await options.vaultService.confirmSetup({
@@ -176,6 +185,57 @@ export async function runOnboardingWorkflow(
   }
 
   return persistPaymentToken(options, vendorId, paymentToken, setupResult.id, setupResult.approvalUrl);
+}
+
+/**
+ * Atomically marks the active vault token for a vendor as REVOKED and appends a hash-chained audit entry.
+ * Fails closed if no active token exists.
+ */
+export function revokeLocalVendorVaultToken(
+  db: Database,
+  repos: Repositories,
+  params: {
+    readonly vendorId: string;
+    readonly reason: string;
+    readonly actor?: 'owner' | 'system';
+  }
+): RevokeLocalTokenResult {
+  const vendorId = params.vendorId.trim();
+  if (!vendorId) {
+    return { success: false, error: 'Vendor ID must be explicitly specified' };
+  }
+
+  return runInTransaction(db, () => {
+    const activeToken = repos.vendorVaultTokens.getByVendorId(vendorId);
+    if (!activeToken) {
+      return {
+        success: false,
+        error: `No active vaulted token found for vendor '${vendorId}'`,
+      };
+    }
+
+    repos.vendorVaultTokens.updateStatus(activeToken.id, 'REVOKED');
+    const maskedTokenId = maskTokenId(activeToken.vault_token_id);
+
+    writeAuditLogEntry(db, repos, {
+      actor: params.actor ?? 'owner',
+      event: 'vault_token_revoked',
+      requestId: null,
+      payload: {
+        vendor_id: vendorId,
+        vault_token_row_id: activeToken.id,
+        paypal_customer_ref: activeToken.paypal_customer_ref,
+        vault_token_id_masked: maskedTokenId,
+        reason: params.reason,
+      },
+    });
+
+    return {
+      success: true,
+      revokedRowId: activeToken.id,
+      maskedTokenId,
+    };
+  });
 }
 
 // ============================================================================
@@ -198,9 +258,10 @@ function persistPaymentToken(
   const tokenRowId = `vtok-${crypto.randomUUID()}`;
   const now = new Date().toISOString();
   const customerRef = paymentToken.customerId ?? paymentToken.payerEmail ?? 'sandbox-buyer';
+  let replacedRowId: string | undefined;
 
   try {
-    // Run DB insert and audit log in one transaction
+    // Run DB revocation (if --replace), insert, and audit log(s) in one transaction
     runInTransaction(options.db, () => {
       // Re-verify vendor still exists
       const currentVendor = options.repos.vendors.getById(vendorId);
@@ -208,10 +269,36 @@ function persistPaymentToken(
         throw new Error(`Vendor '${vendorId}' no longer exists in database`);
       }
 
-      // Re-verify no race condition inserted another token
+      // Reject reusing any previously vaulted/revoked token ID for this vendor
+      const priorTokens = options.repos.vendorVaultTokens.listByVendorId(vendorId);
+      if (priorTokens.some((t) => t.vault_token_id === paymentToken.id)) {
+        throw new Error(
+          `Replacement token matches an existing or previously revoked token (${maskTokenId(paymentToken.id)}) for vendor '${vendorId}'`
+        );
+      }
+
+      // Re-verify active token status inside transaction
       const currentToken = options.repos.vendorVaultTokens.getByVendorId(vendorId);
       if (currentToken) {
-        throw new Error(`Vendor '${vendorId}' already has a vaulted token`);
+        if (!options.replaceExisting) {
+          throw new Error(`Vendor '${vendorId}' already has a vaulted token`);
+        }
+
+        options.repos.vendorVaultTokens.updateStatus(currentToken.id, 'REVOKED');
+        replacedRowId = currentToken.id;
+
+        writeAuditLogEntry(options.db, options.repos, {
+          actor: 'owner',
+          event: 'vault_token_revoked',
+          requestId: null,
+          payload: {
+            vendor_id: vendorId,
+            vault_token_row_id: currentToken.id,
+            paypal_customer_ref: currentToken.paypal_customer_ref,
+            vault_token_id_masked: maskTokenId(currentToken.vault_token_id),
+            reason: 'replaced_via_onboard_vault',
+          },
+        });
       }
 
       const tokenRow: VendorVaultTokenRow = {
@@ -235,6 +322,7 @@ function persistPaymentToken(
           vault_token_row_id: tokenRowId,
           paypal_customer_ref: customerRef,
           vault_token_id_masked: maskTokenId(paymentToken.id),
+          ...(replacedRowId ? { replaced_row_id: replacedRowId } : {}),
         },
       });
     });
@@ -247,6 +335,9 @@ function persistPaymentToken(
     logger.log(` Status           : ${paymentToken.status ?? 'VAULTED'}`);
     logger.log(` Customer Ref     : ${customerRef}`);
     logger.log(` Database Row ID  : ${tokenRowId}`);
+    if (replacedRowId) {
+      logger.log(` Replaced Row ID  : ${replacedRowId}`);
+    }
     logger.log('================================================================\n');
 
     return {
@@ -255,6 +346,7 @@ function persistPaymentToken(
       approvalUrl,
       paymentTokenId: paymentToken.id,
       vaultTokenRowId: tokenRowId,
+      replacedRowId,
     };
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -303,6 +395,7 @@ async function main(): Promise<void> {
   let connectorKey: string | undefined;
   let confirmSetupTokenId: string | undefined;
   let setupOnly = false;
+  let replaceExisting = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -314,13 +407,15 @@ async function main(): Promise<void> {
       confirmSetupTokenId = args[++i]!;
     } else if (arg === '--setup-only') {
       setupOnly = true;
+    } else if (arg === '--replace') {
+      replaceExisting = true;
     }
   }
 
   if (!vendorId) {
     console.error('\n[Error] Missing required --vendor <vendorId> parameter.');
     console.error('Usage:');
-    console.error('  npx tsx demo/onboardVault.ts --vendor <vendorId> [--connector <connectorKey>] [--setup-only] [--confirm <setupTokenId>]\n');
+    console.error('  npx tsx demo/onboardVault.ts --vendor <vendorId> [--connector <connectorKey>] [--setup-only] [--confirm <setupTokenId>] [--replace]\n');
     process.exit(1);
   }
 
@@ -358,6 +453,7 @@ async function main(): Promise<void> {
     connectorKey,
     setupOnly,
     confirmSetupTokenId,
+    replaceExisting,
   });
 
   if (!result.success) {

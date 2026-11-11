@@ -13,9 +13,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as crypto from 'node:crypto';
 import { createDatabase, runMigrations, type Database } from '../../src/db/connection.js';
 import { createRepositories, type Repositories } from '../../src/db/repositories.js';
 import { toMinorUnits } from '../../src/core/money.js';
+import { decryptReplyMarkup } from '../../src/telegram/crypto.js';
 import {
   evaluateAndReserve,
   computeSnapshotHash,
@@ -629,6 +631,112 @@ describe('M1-T8: Core Service — evaluateAndReserve', () => {
       expect(ledgerCount.count).toBe(0);
       const auditCount = db.prepare('SELECT COUNT(*) as count FROM audit_log WHERE request_id = ?').get('req-doomed-1') as { count: number };
       expect(auditCount.count).toBe(0);
+    });
+  });
+
+  // ==========================================================================
+  // 7. Configuration & Public URL Forwarding (Task A)
+  // ==========================================================================
+  describe('Configuration & Public URL Forwarding', () => {
+    it('uses PUBLIC_BASE_URL (ignoring deprecated PAYGUARD_PUBLIC_BASE_URL) and encrypts inline keyboard using explicit telegramEncryptionKey', () => {
+      const prevPayguardUrl = process.env.PAYGUARD_PUBLIC_BASE_URL;
+      const prevPublicUrl = process.env.PUBLIC_BASE_URL;
+      const encKey = crypto.randomBytes(32).toString('hex');
+
+      repos.owners.linkTelegram({
+        ownerId: 'default',
+        chatId: '99887766',
+        userId: '99887766',
+        username: 'alice_tg',
+        linkedAtIso: new Date().toISOString(),
+      });
+
+      try {
+        process.env.PAYGUARD_PUBLIC_BASE_URL = 'https://deprecated.invalid';
+        process.env.PUBLIC_BASE_URL = 'https://public.payguard.test/';
+
+        const held = evaluateAndReserve(db, {
+          agentId: 'agent-1',
+          vendorId: 'vendor-1',
+          amountMinor: toMinorUnits(4000), // > $25 auto_limit -> HELD
+          currency: 'USD',
+          purpose: 'Config forwarding check',
+          category: 'cloud',
+          idempotencyKey: 'idem-cfg-url-1',
+          requestId: 'req-cfg-url-1',
+          telegramEncryptionKey: encKey,
+        });
+
+        expect(held.decision).toBe('HOLD');
+        const outboxRow = repos.notifications.getByDedupKey('payment_held:req-cfg-url-1')!;
+        expect(outboxRow).toBeDefined();
+        expect(outboxRow.message_text).toContain('href="https://public.payguard.test/#/requests/req-cfg-url-1"');
+        expect(outboxRow.message_text).not.toContain('deprecated.invalid');
+        expect(outboxRow.reply_markup_enc).toBeTruthy();
+
+        const decrypted = decryptReplyMarkup(
+          outboxRow.reply_markup_enc!,
+          {
+            outboxId: outboxRow.id,
+            ownerId: outboxRow.owner_id,
+            requestId: 'req-cfg-url-1',
+            recipientChatId: outboxRow.recipient_chat_id,
+            linkedAt: outboxRow.linked_at,
+          },
+          encKey
+        );
+        expect(decrypted.inline_keyboard[0]).toHaveLength(2);
+      } finally {
+        if (prevPayguardUrl === undefined) delete process.env.PAYGUARD_PUBLIC_BASE_URL;
+        else process.env.PAYGUARD_PUBLIC_BASE_URL = prevPayguardUrl;
+        if (prevPublicUrl === undefined) delete process.env.PUBLIC_BASE_URL;
+        else process.env.PUBLIC_BASE_URL = prevPublicUrl;
+      }
+    });
+
+    it('suppresses localhost dashboard links when isProduction is true and publicBaseUrl is undefined', () => {
+      const prevPublicUrl = process.env.PUBLIC_BASE_URL;
+      repos.owners.linkTelegram({
+        ownerId: 'default',
+        chatId: '99887766',
+        userId: '99887766',
+        username: 'alice_tg',
+        linkedAtIso: new Date().toISOString(),
+      });
+
+      try {
+        process.env.PUBLIC_BASE_URL = 'http://localhost:3000';
+
+        const held = evaluateAndReserve(db, {
+          agentId: 'agent-1',
+          vendorId: 'vendor-1',
+          amountMinor: toMinorUnits(8500), // 85% of $100 daily budget + > $25 auto_limit -> HELD + BUDGET_WARNING
+          currency: 'USD',
+          purpose: 'Production dashboard link suppression',
+          category: 'cloud',
+          idempotencyKey: 'idem-cfg-prod-1',
+          requestId: 'req-cfg-prod-1',
+          publicBaseUrl: undefined,
+          isProduction: true,
+        });
+
+        expect(held.decision).toBe('HOLD');
+        const heldOutbox = repos.notifications.getByDedupKey('payment_held:req-cfg-prod-1')!;
+        expect(heldOutbox.message_text).not.toContain('http://localhost');
+        expect(heldOutbox.message_text).not.toContain('href=');
+
+        const warningRows = repos.notifications
+          .listRecent()
+          .filter((r) => r.event_type === 'BUDGET_WARNING');
+        expect(warningRows.length).toBeGreaterThan(0);
+        for (const w of warningRows) {
+          expect(w.message_text).not.toContain('http://localhost');
+          expect(w.message_text).not.toContain('href=');
+        }
+      } finally {
+        if (prevPublicUrl === undefined) delete process.env.PUBLIC_BASE_URL;
+        else process.env.PUBLIC_BASE_URL = prevPublicUrl;
+      }
     });
   });
 });

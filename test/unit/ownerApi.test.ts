@@ -24,17 +24,20 @@
  * - Fail closed on invalid input, unknown IDs, and expired holds
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as crypto from 'node:crypto';
 import { createDatabase, runMigrations, type Database } from '../../src/db/connection.js';
 import { Repositories } from '../../src/db/repositories.js';
 import { createPayGuardMcpServer, type PayGuardMcpServerInstance } from '../../src/mcp/server.js';
+import { loadConfig } from '../../src/config/index.js';
 import { hashOwnerPassphrase, OWNER_COOKIE_NAME } from '../../src/auth/owner.js';
 import { mintApprovalToken } from '../../src/approvals/tokens.js';
+import { mintTelegramApprovalCallbacks } from '../../src/telegram/tokens.js';
 import { toMinorUnits } from '../../src/core/money.js';
 import { writeAuditLogEntry } from '../../src/core/stateMachine.js';
 import { computeSnapshotHash } from '../../src/core/service.js';
-import type { PayPalAuthorizationsService } from '../../src/paypal/authorizations.js';
+import { AuthorizationError, type PayPalAuthorizationsService } from '../../src/paypal/authorizations.js';
+import { PayPalHttpError } from '../../src/paypal/http.js';
 import type { AgentRow, VendorRow, PolicyVersionRow, PaymentRequestRow } from '../../src/db/types.js';
 
 describe('M4-T5: Owner REST API Unit & Security Integration Tests', () => {
@@ -736,6 +739,141 @@ describe('M4-T5: Owner REST API Unit & Security Integration Tests', () => {
       expect(auditEntries.length).toBe(1);
       expect(auditEntries[0]?.actor).toBe('owner');
     });
+
+    it('POST /api/policies serializes concurrent policy creation requests atomically without version collisions', async () => {
+      const validPolicy1 = {
+        currency_allowlist: ['USD'],
+        auto_limit_minor: 2500,
+        hard_cap_minor: 16000,
+        agent_daily_budget_minor: 9000,
+        global_daily_budget_minor: 35000,
+        velocity: { max_requests: 12, window_minutes: 15 },
+        duplicate_window_minutes: 30,
+        new_vendor_action: 'DENY',
+        hold_ttl_minutes: 25,
+      };
+
+      const validPolicy2 = {
+        currency_allowlist: ['USD', 'EUR'],
+        auto_limit_minor: 3000,
+        hard_cap_minor: 18000,
+        agent_daily_budget_minor: 10000,
+        global_daily_budget_minor: 40000,
+        velocity: { max_requests: 15, window_minutes: 15 },
+        duplicate_window_minutes: 30,
+        new_vendor_action: 'HOLD',
+        hold_ttl_minutes: 30,
+      };
+
+      const [res1, res2] = await Promise.all([
+        fetch(`http://localhost:${serverPort}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(validPolicy1),
+        }),
+        fetch(`http://localhost:${serverPort}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(validPolicy2),
+        }),
+      ]);
+
+      expect(res1.status).toBe(201);
+      expect(res2.status).toBe(201);
+
+      const d1 = (await res1.json()) as { version: number };
+      const d2 = (await res2.json()) as { version: number };
+
+      const versions = [d1.version, d2.version].sort((a, b) => a - b);
+      expect(versions).toEqual([2, 3]);
+
+      const activePolicy = repos.policyVersions.getActive();
+      expect(activePolicy?.version).toBe(3);
+    });
+
+    it('POST /api/policies enforces MAX_HARD_CAP_MINOR on manual policy creation and updates', async () => {
+      const cappedConfig = loadConfig({
+        NODE_ENV: 'test',
+        MAX_HARD_CAP_MINOR: '50000',
+        SESSION_SECRET: 'test-session-secret-min-16-chars-long',
+      });
+
+      const cappedServer = createPayGuardMcpServer({
+        db,
+        repos,
+        config: cappedConfig,
+        secureCookie: false,
+      });
+      const started = await cappedServer.start(0);
+
+      try {
+        const loginRes = await fetch(`http://127.0.0.1:${started.port}/api/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passphrase: ownerPassphrase }),
+        });
+        expect(loginRes.status).toBe(200);
+        const cookie = loginRes.headers.get('set-cookie')!.split(';')[0]!;
+        const { csrfToken: capCsrf } = (await loginRes.json()) as { csrfToken: string };
+
+        const baseRules = {
+          currency_allowlist: ['USD'],
+          auto_limit_minor: 5000,
+          agent_daily_budget_minor: 5000,
+          global_daily_budget_minor: 20000,
+          velocity: { max_requests: 5, window_minutes: 10 },
+          duplicate_window_minutes: 60,
+          new_vendor_action: 'HOLD',
+          hold_ttl_minutes: 15,
+        };
+
+        // Exact boundary (50000 === MAX_HARD_CAP_MINOR) succeeds
+        const boundaryRes = await fetch(`http://127.0.0.1:${started.port}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: cookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...baseRules,
+            hard_cap_minor: 50000,
+          }),
+        });
+        expect(boundaryRes.status).toBe(201);
+        expect(repos.policyVersions.getActive()?.version).toBe(2);
+
+        // Ceiling + 1 (50001) fails closed and preserves active policy v2 without audit row
+        const exceedRes = await fetch(`http://127.0.0.1:${started.port}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: cookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...baseRules,
+            hard_cap_minor: 50001,
+          }),
+        });
+        expect(exceedRes.status).toBe(400);
+        const exceedBody = (await exceedRes.json()) as { error: string; details?: { max_hard_cap_minor?: number } };
+        expect(exceedBody.error).toContain('MAX_HARD_CAP_MINOR');
+        expect(exceedBody.details?.max_hard_cap_minor).toBe(50000);
+        expect(repos.policyVersions.getActive()?.version).toBe(2);
+        expect(repos.auditLog.list({ event: 'POLICY_ACTIVATED' })).toHaveLength(1);
+      } finally {
+        await cappedServer.close();
+      }
+    });
   });
 
   // ============================================================================
@@ -1149,6 +1287,270 @@ describe('M4-T5: Owner REST API Unit & Security Integration Tests', () => {
       expect(res2.status).toBe(200);
       const data2 = (await res2.json()) as { limit: number };
       expect(data2.limit).toBe(1);
+    });
+  });
+
+  // ============================================================================
+  // 14. M6-T5 WS4: Shared Service Execution, Cross-Channel Invalidation & HTTP Codes
+  // ============================================================================
+
+  describe('14. M6-T5 WS4: Dashboard Execution Accuracy & Cross-Channel Token Invalidation', () => {
+    it('invalidates BOTH web tokens and Telegram callbacks when approved or voided via dashboard', async () => {
+      const linkTime = new Date().toISOString();
+      repos.owners.linkTelegram({
+        ownerId: 'default',
+        chatId: '99887766',
+        username: 'owner_tg',
+        userId: '55443322',
+        linkedAtIso: linkTime,
+      });
+
+      const reqApprove = seedPaymentRequest({ id: 'req-xchan-app-1', status: 'HELD' });
+      const webApprove = mintApprovalToken(db, repos, {
+        requestId: reqApprove.id,
+        action: 'APPROVE',
+        channel: 'web',
+      });
+      const tgApprove = mintTelegramApprovalCallbacks({
+        repos,
+        requestId: reqApprove.id,
+        ownerId: 'default',
+        telegramChatId: '99887766',
+        telegramUserId: '55443322',
+        linkedAt: linkTime,
+        snapshotHash: reqApprove.snapshot_hash!,
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      });
+
+      const appRes = await fetch(`http://localhost:${serverPort}/api/requests/${reqApprove.id}/approve`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+          'Content-Type': 'application/json',
+        },
+      });
+      expect(appRes.status).toBe(200);
+
+      expect(repos.approvals.listByRequestId(reqApprove.id)[0]?.used_at).not.toBeNull();
+      expect(repos.telegramApprovalCallbacks.getByTokenHash(tgApprove.approveTokenHash)?.used_at).not.toBeNull();
+      expect(repos.telegramApprovalCallbacks.getByTokenHash(tgApprove.voidTokenHash)?.used_at).not.toBeNull();
+      expect(webApprove.rawToken).toBeDefined();
+
+      const reqVoid = seedPaymentRequest({ id: 'req-xchan-void-1', status: 'HELD' });
+      repos.ledger.insert({
+        id: 'led-xchan-void-1',
+        request_id: reqVoid.id,
+        kind: 'RESERVE',
+        amount_minor: reqVoid.amount_minor,
+        currency: 'USD',
+        created_at: new Date().toISOString(),
+      });
+      mintApprovalToken(db, repos, { requestId: reqVoid.id, action: 'VOID', channel: 'web' });
+      const tgVoid = mintTelegramApprovalCallbacks({
+        repos,
+        requestId: reqVoid.id,
+        ownerId: 'default',
+        telegramChatId: '99887766',
+        telegramUserId: '55443322',
+        linkedAt: linkTime,
+        snapshotHash: reqVoid.snapshot_hash!,
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      });
+
+      const voidRes = await fetch(`http://localhost:${serverPort}/api/requests/${reqVoid.id}/void`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+          'Content-Type': 'application/json',
+        },
+      });
+      expect(voidRes.status).toBe(200);
+
+      expect(repos.approvals.listByRequestId(reqVoid.id)[0]?.used_at).not.toBeNull();
+      expect(repos.telegramApprovalCallbacks.getByTokenHash(tgVoid.approveTokenHash)?.used_at).not.toBeNull();
+      expect(repos.telegramApprovalCallbacks.getByTokenHash(tgVoid.voidTokenHash)?.used_at).not.toBeNull();
+    });
+
+    it('returns HTTP 202 for CAPTURING ambiguity and HTTP 500 for FAILED decline on POST /api/requests/:id/approve', async () => {
+      const customAuthService = {
+        captureAuthorization: vi.fn(),
+        voidAuthorization: vi.fn(),
+        getAuthorization: vi.fn(),
+      } as unknown as PayPalAuthorizationsService;
+
+      const customServer = createPayGuardMcpServer({
+        db,
+        repos,
+        ownerSessionStore: serverInstance.ownerSessionStore,
+        authorizationsService: customAuthService,
+        secureCookie: false,
+      });
+      const started = await customServer.start(0);
+
+      try {
+        // 1. Ambiguous capture timeout -> CAPTURING -> HTTP 202
+        const reqAmbiguous = seedPaymentRequest({ id: 'req-http-202-cap', status: 'HELD' });
+        vi.mocked(customAuthService.captureAuthorization).mockRejectedValueOnce(
+          new AuthorizationError('NETWORK', 'Timeout contacting PayPal', {
+            causeError: new PayPalHttpError({ message: 'Timeout', code: 'NETWORK' }),
+          })
+        );
+
+        const res202 = await fetch(
+          `http://127.0.0.1:${started.port}/api/requests/${reqAmbiguous.id}/approve`,
+          {
+            method: 'POST',
+            headers: {
+              Cookie: sessionCookie,
+              'x-csrf-token': csrfToken,
+            },
+          }
+        );
+        expect(res202.status).toBe(202);
+        const body202 = (await res202.json()) as {
+          success: boolean;
+          status: string;
+          reconciliationRequired: boolean;
+        };
+        expect(body202.success).toBe(false);
+        expect(body202.status).toBe('CAPTURING');
+        expect(body202.reconciliationRequired).toBe(true);
+
+        // 2. Definitive PayPal decline -> FAILED -> HTTP 500 (never 200 success: true)
+        const reqDeclined = seedPaymentRequest({ id: 'req-http-500-fail', status: 'HELD' });
+        repos.ledger.insert({
+          id: 'led-http-500-fail',
+          request_id: reqDeclined.id,
+          kind: 'RESERVE',
+          amount_minor: reqDeclined.amount_minor,
+          currency: 'USD',
+          created_at: new Date().toISOString(),
+        });
+        vi.mocked(customAuthService.captureAuthorization).mockRejectedValueOnce(
+          new AuthorizationError('AUTH_EXPIRED', 'Authorization expired at PayPal', {
+            causeError: new PayPalHttpError({
+              message: 'Expired',
+              code: 'AUTH_EXPIRED',
+              status: 422,
+              issue: 'AUTHORIZATION_EXPIRED',
+            }),
+          })
+        );
+
+        const res500 = await fetch(
+          `http://127.0.0.1:${started.port}/api/requests/${reqDeclined.id}/approve`,
+          {
+            method: 'POST',
+            headers: {
+              Cookie: sessionCookie,
+              'x-csrf-token': csrfToken,
+            },
+          }
+        );
+        expect(res500.status).toBe(500);
+        const body500 = (await res500.json()) as { success: boolean; status: string };
+        expect(body500.success).toBe(false);
+        expect(body500.status).toBe('FAILED');
+        expect(repos.paymentRequests.getById(reqDeclined.id)?.status).toBe('FAILED');
+      } finally {
+        await started.close();
+      }
+    });
+
+    it('sets remote_void_status=FAILED without auth ID and PENDING when authorizationsService is missing on POST /api/requests/:id/void', async () => {
+      // Case A: Missing paypal_authorization_id -> remote_void_status = FAILED, HTTP 202
+      const reqNoAuth = seedPaymentRequest({
+        id: 'req-void-no-auth-ws4',
+        status: 'HELD',
+        paypal_authorization_id: null,
+      });
+      repos.ledger.insert({
+        id: 'led-void-no-auth-ws4',
+        request_id: reqNoAuth.id,
+        kind: 'RESERVE',
+        amount_minor: reqNoAuth.amount_minor,
+        currency: 'USD',
+        created_at: new Date().toISOString(),
+      });
+
+      const resNoAuth = await fetch(`http://localhost:${serverPort}/api/requests/${reqNoAuth.id}/void`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+        },
+      });
+      expect(resNoAuth.status).toBe(202);
+      const bodyNoAuth = (await resNoAuth.json()) as { remoteVoidStatus: string; remoteVoidSuccess: boolean };
+      expect(bodyNoAuth.remoteVoidStatus).toBe('FAILED');
+      expect(bodyNoAuth.remoteVoidSuccess).toBe(false);
+      expect(repos.paymentRequests.getById(reqNoAuth.id)?.remote_void_status).toBe('FAILED');
+      expect(
+        repos.auditLog.listByRequestId(reqNoAuth.id).some((a) => a.event === 'PAYPAL_VOID_UNRESOLVED_NO_AUTH_ID')
+      ).toBe(true);
+
+      // Case B: Auth ID present, authorizationsService missing -> remote_void_status = PENDING, HTTP 202
+      const noServiceServer = createPayGuardMcpServer({
+        db,
+        repos,
+        ownerSessionStore: serverInstance.ownerSessionStore,
+        // intentionally omit authorizationsService
+        secureCookie: false,
+      });
+      const started = await noServiceServer.start(0);
+      try {
+        const reqNoSvc = seedPaymentRequest({
+          id: 'req-void-no-svc-ws4',
+          status: 'HELD',
+          paypal_authorization_id: 'AUTH-PENDING-SVC-1',
+        });
+        repos.ledger.insert({
+          id: 'led-void-no-svc-ws4',
+          request_id: reqNoSvc.id,
+          kind: 'RESERVE',
+          amount_minor: reqNoSvc.amount_minor,
+          currency: 'USD',
+          created_at: new Date().toISOString(),
+        });
+
+        const resNoSvc = await fetch(`http://127.0.0.1:${started.port}/api/requests/${reqNoSvc.id}/void`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+          },
+        });
+        expect(resNoSvc.status).toBe(202);
+        const bodyNoSvc = (await resNoSvc.json()) as { remoteVoidStatus: string; remoteVoidSuccess: boolean };
+        expect(bodyNoSvc.remoteVoidStatus).toBe('PENDING');
+        expect(bodyNoSvc.remoteVoidSuccess).toBe(false);
+        expect(repos.paymentRequests.getById(reqNoSvc.id)?.remote_void_status).toBe('PENDING');
+
+        // Bonus WS5 check through HTTP: approving when authorizationsService is missing returns 500 without CAPTURING
+        const reqAppNoSvc = seedPaymentRequest({
+          id: 'req-app-no-svc-ws5',
+          status: 'HELD',
+          paypal_authorization_id: 'AUTH-APP-NOSVC-1',
+        });
+        const resAppNoSvc = await fetch(
+          `http://127.0.0.1:${started.port}/api/requests/${reqAppNoSvc.id}/approve`,
+          {
+            method: 'POST',
+            headers: {
+              Cookie: sessionCookie,
+              'x-csrf-token': csrfToken,
+            },
+          }
+        );
+        expect(resAppNoSvc.status).toBe(500);
+        const bodyAppNoSvc = (await resAppNoSvc.json()) as { error: string; status: string };
+        expect(bodyAppNoSvc.error).toBe('CONFIG_ERROR');
+        expect(repos.paymentRequests.getById(reqAppNoSvc.id)?.status).toBe('APPROVED');
+      } finally {
+        await started.close();
+      }
     });
   });
 });

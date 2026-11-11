@@ -35,7 +35,7 @@ export function Badge({ status, label, className }: BadgeProps) {
   } else if (norm === 'DENIED' || norm === 'FAILED' || norm === 'BLOCKED' || norm === 'SUSPENDED') {
     colorClasses = 'bg-[var(--status-error-bg)] text-[var(--status-error)] border-[var(--status-error-border)]';
   } else if (norm === 'APPROVED' || norm === 'CAPTURING' || norm === 'AUTO_EXECUTING') {
-    colorClasses = 'bg-[var(--accent-sage)]/20 text-[var(--accent-sage)] border-[var(--accent-sage)]/35';
+    colorClasses = 'bg-[var(--accent-lavender)]/15 text-[var(--accent-lavender)] border-[var(--accent-lavender)]/30';
   } else if (norm === 'VOIDED' || norm === 'EXPIRED') {
     colorClasses = 'bg-[var(--elevated-bg)] text-[var(--text-secondary)] border-[var(--border-color)]';
   }
@@ -58,7 +58,7 @@ export function Badge({ status, label, className }: BadgeProps) {
             : norm === 'DENIED' || norm === 'FAILED' || norm === 'BLOCKED' || norm === 'SUSPENDED'
             ? 'bg-[var(--status-error)]'
             : norm === 'APPROVED' || norm === 'CAPTURING' || norm === 'AUTO_EXECUTING'
-            ? 'bg-[var(--accent-sage)]'
+            ? 'bg-[var(--accent-lavender)]'
             : 'bg-[var(--text-secondary)]'
         )}
         aria-hidden="true"

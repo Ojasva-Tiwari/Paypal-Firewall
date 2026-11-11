@@ -37,7 +37,13 @@ import type {
   LedgerRow,
   AuditLogRow,
 } from '../db/types.js';
-import type { MinorUnits } from './money.js';
+import { formatMinorUnitsToDecimal, type MinorUnits } from './money.js';
+import { sanitizePublicBaseUrl } from '../config/index.js';
+import {
+  formatPaymentCapturedMessage,
+  formatPaymentFailedMessage,
+  enqueuePaymentTerminalOutcome,
+} from '../telegram/notifications.js';
 import type {
   PayPalOrdersService,
   PayPalOrderResult,
@@ -70,6 +76,8 @@ export interface ExecuteDecisionOptions {
   readonly defaultVaultTokenId?: string;
   readonly now?: Date;
   readonly actor?: AuditActor;
+  readonly publicBaseUrl?: string;
+  readonly isProduction?: boolean;
 }
 
 export type ExecutedAction =
@@ -157,10 +165,25 @@ interface ExtractedErrorDetails {
   status?: number;
   issue?: string;
   debugId?: string;
+  orderId?: string;
   message: string;
   isAlreadyCaptured: boolean;
   isNetworkOrTimeout: boolean;
   isServer5xx: boolean;
+}
+
+function sanitizeRecoveredOrderId(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > 128) {
+    return undefined;
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
 }
 
 function extractErrorDetails(err: unknown): ExtractedErrorDetails {
@@ -168,6 +191,7 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
   let status: number | undefined;
   let issue: string | undefined;
   let debugId: string | undefined;
+  let orderId: string | undefined;
   const message = err instanceof Error ? err.message : String(err);
 
   if (err && typeof err === 'object') {
@@ -176,6 +200,7 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
     if (typeof o.status === 'number') status = o.status;
     if (typeof o.issue === 'string') issue = o.issue;
     if (typeof o.debugId === 'string') debugId = o.debugId;
+    orderId = sanitizeRecoveredOrderId(o.orderId);
 
     if (o.causeError && typeof o.causeError === 'object') {
       const cause = o.causeError as Record<string, unknown>;
@@ -183,6 +208,7 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
       if (typeof cause.status === 'number') status = cause.status;
       if (typeof cause.issue === 'string') issue = cause.issue;
       if (!debugId && typeof cause.debugId === 'string') debugId = cause.debugId;
+      if (!orderId) orderId = sanitizeRecoveredOrderId(cause.orderId);
     }
   }
 
@@ -196,10 +222,13 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
 
   const isNetworkOrTimeout = Boolean(
     code === 'NETWORK' ||
+    (err instanceof Error && err.name === 'AbortError') ||
     message.includes('timeout') ||
     message.includes('ETIMEDOUT') ||
     message.includes('ECONNRESET') ||
-    message.includes('Network')
+    message.includes('Network') ||
+    message.includes('aborted') ||
+    message.includes('AbortError')
   );
 
   const isServer5xx = Boolean(
@@ -212,6 +241,7 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
     status,
     issue,
     debugId,
+    orderId,
     message,
     isAlreadyCaptured,
     isNetworkOrTimeout,
@@ -226,6 +256,11 @@ function extractErrorDetails(err: unknown): ExtractedErrorDetails {
 function isDefinitivePayPalFailure(details: ExtractedErrorDetails): boolean {
   // If money was already captured in a prior attempt, this is NOT a failure!
   if (details.isAlreadyCaptured) {
+    return false;
+  }
+
+  // If PayPal returned a remote orderId, do not treat as a definitive failure that releases reservation
+  if (details.orderId) {
     return false;
   }
 
@@ -271,6 +306,20 @@ function isDefinitivePayPalFailure(details: ExtractedErrorDetails): boolean {
 // Ledger and State Helper Functions
 // ============================================================================
 
+function resolveNotificationUrlOptions(options: ExecuteDecisionOptions): {
+  publicBaseUrl?: string;
+  isProduction: boolean;
+} {
+  const isProd = options.isProduction ?? process.env.NODE_ENV === 'production';
+  const hasExplicitBaseUrl = 'publicBaseUrl' in options;
+  const publicBaseUrl = hasExplicitBaseUrl
+    ? sanitizePublicBaseUrl(options.publicBaseUrl, isProd)
+    : isProd
+      ? undefined
+      : sanitizePublicBaseUrl(process.env.PUBLIC_BASE_URL, isProd);
+  return { publicBaseUrl, isProduction: isProd };
+}
+
 function commitDefinitiveFailure(
   db: Database,
   repos: Repositories,
@@ -285,20 +334,32 @@ function commitDefinitiveFailure(
     event?: string;
     debugId?: string;
     errorDetails?: unknown;
+    publicBaseUrl?: string;
+    isProduction?: boolean;
   }
 ): ExecuteDecisionResult {
   return runInTransaction(db, () => {
-    // 1. Insert RELEASE row in ledger
-    const ledgerId = `led-${crypto.randomUUID()}`;
-    const ledgerEntry: LedgerRow = {
-      id: ledgerId,
-      request_id: params.requestId,
-      kind: 'RELEASE',
-      amount_minor: params.amountMinor,
-      currency: params.currency,
-      created_at: params.timestamp,
-    };
-    repos.ledger.insert(ledgerEntry);
+    const ledgerEntries = repos.ledger.listByRequestId(params.requestId);
+    if (ledgerEntries.some((l) => l.kind === 'SPEND')) {
+      throw new Error(
+        `Illegal ledger state: cannot release reservation on request '${params.requestId}' with existing SPEND entry`
+      );
+    }
+
+    // 1. Insert RELEASE row in ledger (idempotent guard: never duplicate RELEASE)
+    let ledgerEntry = ledgerEntries.find((l) => l.kind === 'RELEASE');
+    if (!ledgerEntry) {
+      const ledgerId = `led-${crypto.randomUUID()}`;
+      ledgerEntry = {
+        id: ledgerId,
+        request_id: params.requestId,
+        kind: 'RELEASE',
+        amount_minor: params.amountMinor,
+        currency: params.currency,
+        created_at: params.timestamp,
+      };
+      repos.ledger.insert(ledgerEntry);
+    }
 
     // 2. Transition fromStatus -> FAILED & write audit log
     const { request: updatedRequest, auditEntry } = transitionPaymentRequest(db, repos, {
@@ -313,6 +374,26 @@ function commitDefinitiveFailure(
         debug_id: params.debugId,
         details: params.errorDetails,
       },
+    });
+
+    // 3. Atomically supersede intermediate rows and enqueue terminal PAYMENT_FAILED notification
+    const reqRow = repos.paymentRequests.getById(params.requestId);
+    const vendor = reqRow ? repos.vendors.getById(reqRow.vendor_id) : undefined;
+    const vendorName = vendor?.name ?? reqRow?.vendor_id ?? 'Unknown Vendor';
+    const failedText = formatPaymentFailedMessage({
+      requestId: params.requestId,
+      amountDecimal: formatMinorUnitsToDecimal(params.amountMinor),
+      currency: params.currency,
+      vendorName,
+      reason: params.reason,
+      publicBaseUrl: params.publicBaseUrl,
+      isProduction: params.isProduction,
+    });
+    enqueuePaymentTerminalOutcome(repos, {
+      eventType: 'PAYMENT_FAILED',
+      requestId: params.requestId,
+      dedupKey: `payment_failed:${params.requestId}`,
+      messageText: failedText,
     });
 
     return {
@@ -358,6 +439,8 @@ function recordAmbiguousOutcome(
       requestId: params.requestId,
       timestamp: params.timestamp,
       payload: {
+        ...(params.orderId ? { paypal_order_id: params.orderId } : {}),
+        ...(params.captureId ? { paypal_capture_id: params.captureId } : {}),
         reason: params.reason,
         debug_id: params.debugId,
         details: params.details,
@@ -380,6 +463,7 @@ async function doExecuteDecision(
   const now = options.now ?? new Date();
   const nowIso = now.toISOString();
   const actor = options.actor ?? 'system';
+  const urlOptions = resolveNotificationUrlOptions(options);
 
   // 1. Fetch Request
   const request = repos.paymentRequests.getById(requestId);
@@ -458,11 +542,27 @@ async function doExecuteDecision(
     );
   }
 
+  if (request.status === 'HELD' && !request.paypal_authorization_id && request.paypal_order_id !== null) {
+    throw new AmbiguousExecutionError(
+      requestId,
+      `Payment request is in-flight with status 'HELD' and existing paypal_order_id '${request.paypal_order_id}'. Reconciliation required before retrying.`
+    );
+  }
+
   const previousAudit = repos.auditLog.listByRequestId(requestId);
-  const hadAmbiguousAttempt = previousAudit.some(
-    (a) => a.event === 'EXECUTION_AMBIGUOUS' || a.event === 'EXECUTION_FAILED_AMBIGUOUS'
-  );
-  if (hadAmbiguousAttempt) {
+  let hasUnresolvedAmbiguousAttempt = false;
+  for (const auditEntry of previousAudit) {
+    if (auditEntry.event === 'EXECUTION_AMBIGUOUS' || auditEntry.event === 'EXECUTION_FAILED_AMBIGUOUS') {
+      hasUnresolvedAmbiguousAttempt = true;
+    } else if (
+      auditEntry.event === 'RECONCILE_LINKED_AUTHORIZATION' &&
+      request.status === 'APPROVED' &&
+      Boolean(request.paypal_authorization_id)
+    ) {
+      hasUnresolvedAmbiguousAttempt = false;
+    }
+  }
+  if (hasUnresolvedAmbiguousAttempt) {
     throw new AmbiguousExecutionError(
       requestId,
       'Payment request has a previous ambiguous execution recorded. Reconciliation required before retrying.'
@@ -493,6 +593,7 @@ async function doExecuteDecision(
         timestamp: nowIso,
         reason: 'Missing vendor vault token',
         event: 'EXECUTION_FAILED_PREFLIGHT',
+        ...urlOptions,
       });
     }
 
@@ -524,15 +625,17 @@ async function doExecuteDecision(
           reason: details.message,
           debugId: details.debugId,
           errorDetails: details,
+          ...urlOptions,
         });
       }
 
-      // Ambiguous error: Keep reservation, leave AUTO_EXECUTING, audit, throw
+      // Ambiguous error: Keep reservation, leave AUTO_EXECUTING, preserve any recovered orderId, audit, throw
       recordAmbiguousOutcome(db, repos, {
         requestId,
         actor,
         timestamp: nowIso,
         event: 'EXECUTION_AMBIGUOUS',
+        orderId: details.orderId,
         reason: details.message,
         debugId: details.debugId,
         details,
@@ -563,16 +666,26 @@ async function doExecuteDecision(
 
     // Confirmed capture success! Commit SPEND row and state transition atomically
     return runInTransaction(db, () => {
-      const ledgerId = `led-${crypto.randomUUID()}`;
-      const ledgerEntry: LedgerRow = {
-        id: ledgerId,
-        request_id: requestId,
-        kind: 'SPEND',
-        amount_minor: request.amount_minor,
-        currency: request.currency,
-        created_at: nowIso,
-      };
-      repos.ledger.insert(ledgerEntry);
+      const ledgerEntries = repos.ledger.listByRequestId(requestId);
+      if (ledgerEntries.some((l) => l.kind === 'RELEASE')) {
+        throw new Error(
+          `Illegal ledger state: cannot record SPEND on request '${requestId}' with existing RELEASE entry`
+        );
+      }
+
+      let ledgerEntry = ledgerEntries.find((l) => l.kind === 'SPEND');
+      if (!ledgerEntry) {
+        const ledgerId = `led-${crypto.randomUUID()}`;
+        ledgerEntry = {
+          id: ledgerId,
+          request_id: requestId,
+          kind: 'SPEND',
+          amount_minor: request.amount_minor,
+          currency: request.currency,
+          created_at: nowIso,
+        };
+        repos.ledger.insert(ledgerEntry);
+      }
 
       const { request: updatedRequest, auditEntry } = transitionPaymentRequest(db, repos, {
         requestId,
@@ -588,6 +701,25 @@ async function doExecuteDecision(
           amount_minor: request.amount_minor.toString(),
           currency: request.currency,
         },
+      });
+
+      // Atomically supersede intermediate rows and enqueue terminal PAYMENT_CAPTURED notification
+      const vendor = repos.vendors.getById(request.vendor_id);
+      const vendorName = vendor?.name ?? request.vendor_id;
+      const capturedText = formatPaymentCapturedMessage({
+        requestId,
+        amountDecimal: formatMinorUnitsToDecimal(request.amount_minor),
+        currency: request.currency,
+        vendorName,
+        purpose: request.purpose,
+        captureId: orderResult.capture!.id,
+        ...urlOptions,
+      });
+      enqueuePaymentTerminalOutcome(repos, {
+        eventType: 'PAYMENT_CAPTURED',
+        requestId,
+        dedupKey: `payment_captured:${requestId}`,
+        messageText: capturedText,
       });
 
       return {
@@ -629,6 +761,7 @@ async function doExecuteDecision(
         timestamp: nowIso,
         reason: 'Missing vendor vault token',
         event: 'EXECUTION_FAILED_PREFLIGHT',
+        ...urlOptions,
       });
     }
 
@@ -660,6 +793,7 @@ async function doExecuteDecision(
           reason: details.message,
           debugId: details.debugId,
           errorDetails: details,
+          ...urlOptions,
         });
       }
 
@@ -668,6 +802,7 @@ async function doExecuteDecision(
         actor,
         timestamp: nowIso,
         event: 'EXECUTION_AMBIGUOUS',
+        orderId: details.orderId,
         reason: details.message,
         debugId: details.debugId,
         details,
@@ -745,7 +880,12 @@ async function doExecuteDecision(
         timestamp: nowIso,
         reason: 'Cannot capture approved request: missing paypal_authorization_id',
         event: 'EXECUTION_FAILED_PREFLIGHT',
+        ...urlOptions,
       });
+    }
+
+    if (!options.authorizationsService) {
+      throw new ExecuteDecisionError('CONFIG_ERROR', requestId, 'PayPal authorizationsService not configured');
     }
 
     // Atomic database-level claim: APPROVED -> CAPTURING
@@ -758,10 +898,6 @@ async function doExecuteDecision(
         timestamp: nowIso,
       });
     });
-
-    if (!options.authorizationsService) {
-      throw new ExecuteDecisionError('CONFIG_ERROR', requestId, 'PayPal authorizationsService not configured');
-    }
 
     let captureResult: PayPalCaptureResult;
     try {
@@ -785,6 +921,7 @@ async function doExecuteDecision(
           reason: details.message,
           debugId: details.debugId,
           errorDetails: details,
+          ...urlOptions,
         });
       }
 
@@ -794,6 +931,7 @@ async function doExecuteDecision(
         actor,
         timestamp: nowIso,
         event: 'EXECUTION_AMBIGUOUS',
+        orderId: details.orderId,
         reason: details.message,
         debugId: details.debugId,
         details,
@@ -823,16 +961,26 @@ async function doExecuteDecision(
 
     // Confirmed capture success! Commit SPEND row and state transition atomically
     return runInTransaction(db, () => {
-      const ledgerId = `led-${crypto.randomUUID()}`;
-      const ledgerEntry: LedgerRow = {
-        id: ledgerId,
-        request_id: requestId,
-        kind: 'SPEND',
-        amount_minor: request.amount_minor,
-        currency: request.currency,
-        created_at: nowIso,
-      };
-      repos.ledger.insert(ledgerEntry);
+      const ledgerEntries = repos.ledger.listByRequestId(requestId);
+      if (ledgerEntries.some((l) => l.kind === 'RELEASE')) {
+        throw new Error(
+          `Illegal ledger state: cannot record SPEND on request '${requestId}' with existing RELEASE entry`
+        );
+      }
+
+      let ledgerEntry = ledgerEntries.find((l) => l.kind === 'SPEND');
+      if (!ledgerEntry) {
+        const ledgerId = `led-${crypto.randomUUID()}`;
+        ledgerEntry = {
+          id: ledgerId,
+          request_id: requestId,
+          kind: 'SPEND',
+          amount_minor: request.amount_minor,
+          currency: request.currency,
+          created_at: nowIso,
+        };
+        repos.ledger.insert(ledgerEntry);
+      }
 
       const { request: updatedRequest, auditEntry } = transitionPaymentRequest(db, repos, {
         requestId,
@@ -847,6 +995,25 @@ async function doExecuteDecision(
           amount_minor: request.amount_minor.toString(),
           currency: request.currency,
         },
+      });
+
+      // Atomically supersede intermediate rows and enqueue terminal PAYMENT_CAPTURED notification
+      const vendor = repos.vendors.getById(request.vendor_id);
+      const vendorName = vendor?.name ?? request.vendor_id;
+      const capturedText = formatPaymentCapturedMessage({
+        requestId,
+        amountDecimal: formatMinorUnitsToDecimal(request.amount_minor),
+        currency: request.currency,
+        vendorName,
+        purpose: request.purpose,
+        captureId: captureResult.id,
+        ...urlOptions,
+      });
+      enqueuePaymentTerminalOutcome(repos, {
+        eventType: 'PAYMENT_CAPTURED',
+        requestId,
+        dedupKey: `payment_captured:${requestId}`,
+        messageText: capturedText,
       });
 
       return {

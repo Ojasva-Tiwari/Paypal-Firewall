@@ -44,15 +44,21 @@
  *    - MCP server exposes strictly the 4 canonical tools (no policy tools for agents)
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as crypto from 'node:crypto';
 import { createDatabase, runMigrations, type Database } from '../../src/db/connection.js';
 import { Repositories } from '../../src/db/repositories.js';
 import { createPayGuardMcpServer, type PayGuardMcpServerInstance } from '../../src/mcp/server.js';
+import { loadConfig } from '../../src/config/index.js';
 import { hashOwnerPassphrase, OWNER_COOKIE_NAME } from '../../src/auth/owner.js';
 import { MockAiProvider } from '../../src/ai/mockProvider.js';
 import { AiService } from '../../src/ai/service.js';
-import type { AiPromptOptions } from '../../src/ai/types.js';
+import {
+  AiProviderError,
+  AiRateLimitError,
+  AiTimeoutError,
+  type AiPromptOptions,
+} from '../../src/ai/types.js';
 import { computeProposalHash } from '../../src/ai/policyDrafter.js';
 import { toMinorUnits } from '../../src/core/money.js';
 import type { PolicyVersionRow, VendorRow, AgentRow } from '../../src/db/types.js';
@@ -515,6 +521,76 @@ describe('M5-T6 Phase B: Owner API Policy Proposals & Atomic Activation Integrat
       expect(audit[0]?.actor).toBe('owner');
       const payload = JSON.parse(audit[0]!.payload) as { proposal_id: string };
       expect(payload.proposal_id).toBe(data.id);
+    });
+  });
+
+  // ==========================================================================
+  // 2b. AI Service Error Status Mapping on POST /api/policies/draft
+  // ==========================================================================
+
+  describe('2b. AI Service Error Status Mapping on POST /api/policies/draft', () => {
+    it('maps AI rate limit, timeout, and provider errors to 429, 504, and 502 without persisting proposals', async () => {
+      const originalGenerateStructured = mockProvider.generateStructured.bind(mockProvider);
+      let nextDraftError: Error | null = null;
+      const generateSpy = vi
+        .spyOn(mockProvider, 'generateStructured')
+        .mockImplementation(async (options, schema, signal) => {
+          if (options.kind === 'policy_drafter' && nextDraftError) {
+            throw nextDraftError;
+          }
+          return originalGenerateStructured(options, schema, signal);
+        });
+
+      try {
+        // 1. Rate limited -> 429 AI_SERVICE_RATE_LIMITED
+        nextDraftError = new AiRateLimitError(30_000);
+        const rateLimitRes = await fetch(`http://localhost:${serverPort}/api/policies/draft`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prompt: 'Lower auto limit to $10 (rate limit test)' }),
+        });
+        expect(rateLimitRes.status).toBe(429);
+        const rateLimitData = (await rateLimitRes.json()) as { error: string; message: string };
+        expect(rateLimitData.error).toBe('AI_SERVICE_RATE_LIMITED');
+
+        // 2. Timeout -> 504 AI_SERVICE_TIMEOUT
+        nextDraftError = new AiTimeoutError(10_000);
+        const timeoutRes = await fetch(`http://localhost:${serverPort}/api/policies/draft`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prompt: 'Lower auto limit to $10 (timeout test)' }),
+        });
+        expect(timeoutRes.status).toBe(504);
+        const timeoutData = (await timeoutRes.json()) as { error: string; message: string };
+        expect(timeoutData.error).toBe('AI_SERVICE_TIMEOUT');
+
+        // 3. Provider HTTP failure -> 502 AI_SERVICE_UNAVAILABLE
+        nextDraftError = new AiProviderError('Gemini upstream unavailable', 503, true);
+        const providerErrRes = await fetch(`http://localhost:${serverPort}/api/policies/draft`, {
+          method: 'POST',
+          headers: {
+            Cookie: sessionCookie,
+            'x-csrf-token': csrfToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prompt: 'Lower auto limit to $10 (provider error test)' }),
+        });
+        expect(providerErrRes.status).toBe(502);
+        const providerErrData = (await providerErrRes.json()) as { error: string; message: string };
+        expect(providerErrData.error).toBe('AI_SERVICE_UNAVAILABLE');
+
+        expect(repos.policyProposals.list({ ownerId: 'default' })).toHaveLength(0);
+      } finally {
+        generateSpy.mockRestore();
+      }
     });
   });
 
@@ -1379,6 +1455,177 @@ describe('M5-T6 Phase B: Owner API Policy Proposals & Atomic Activation Integrat
         for (const term of forbiddenTerms) {
           expect(t.name.toLowerCase()).not.toContain(term);
         }
+      }
+    });
+  });
+
+  // ==========================================================================
+  // 8. MAX_HARD_CAP_MINOR Ceiling Enforcement Across Policy Lifecycle
+  // ==========================================================================
+
+  describe('8. MAX_HARD_CAP_MINOR Ceiling Enforcement Across Policy Lifecycle', () => {
+    it('enforces MAX_HARD_CAP_MINOR across drafting, manual policies, and proposal activation routes', async () => {
+      const cappedConfig = loadConfig({
+        NODE_ENV: 'test',
+        MAX_HARD_CAP_MINOR: '50000',
+        SESSION_SECRET: 'test-session-secret-at-least-32-chars',
+      });
+
+      const cappedServer = createPayGuardMcpServer({
+        db,
+        repos,
+        aiService,
+        config: cappedConfig,
+        secureCookie: false,
+      });
+      const started = await cappedServer.start(0);
+
+      try {
+        const loginRes = await fetch(`http://127.0.0.1:${started.port}/api/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passphrase: ownerPassphrase }),
+        });
+        expect(loginRes.status).toBe(200);
+        const capCookie = loginRes.headers.get('set-cookie')!.split(';')[0]!;
+        const { csrfToken: capCsrf } = (await loginRes.json()) as { csrfToken: string };
+
+        // 1. POST /api/policies/draft accepts hard_cap_minor === MAX_HARD_CAP_MINOR (50000)
+        mockProvider.customStructuredResponse = (_prompt: string, options?: AiPromptOptions) => {
+          if (options?.kind === 'injection_detection') {
+            return {
+              is_injection: false,
+              confidence: 'HIGH',
+              attack_categories: [],
+              explanation: 'Clean.',
+            };
+          }
+          return {
+            proposed_rules: {
+              hard_cap_minor: 50000,
+            },
+            explanation: 'Set hard cap to $500.',
+            unsupported_requests: [],
+          };
+        };
+
+        const okDraftRes = await fetch(`http://127.0.0.1:${started.port}/api/policies/draft`, {
+          method: 'POST',
+          headers: {
+            Cookie: capCookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prompt: 'Set hard cap to $500' }),
+        });
+        expect(okDraftRes.status).toBe(201);
+
+        // 2. POST /api/policies/draft rejects hard_cap_minor === MAX_HARD_CAP_MINOR + 1 (50001) without persisting proposal
+        mockProvider.customStructuredResponse = (_prompt: string, options?: AiPromptOptions) => {
+          if (options?.kind === 'injection_detection') {
+            return {
+              is_injection: false,
+              confidence: 'HIGH',
+              attack_categories: [],
+              explanation: 'Clean.',
+            };
+          }
+          return {
+            proposed_rules: {
+              hard_cap_minor: 50001,
+            },
+            explanation: 'Set hard cap to $500.01.',
+            unsupported_requests: [],
+          };
+        };
+
+        const badDraftRes = await fetch(`http://127.0.0.1:${started.port}/api/policies/draft`, {
+          method: 'POST',
+          headers: {
+            Cookie: capCookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prompt: 'Set hard cap to $500.01' }),
+        });
+        expect(badDraftRes.status).toBe(400);
+        const badDraftData = (await badDraftRes.json()) as { error: string };
+        expect(badDraftData.error).toBe('RULE_CONSTRAINT_VIOLATION');
+        expect(repos.policyProposals.list({ ownerId: 'default' })).toHaveLength(1);
+
+        // 3. A pre-existing genuine-hash proposal (75000) exceeding current ceiling (50000) is blocked on ALL activation routes
+        const { version: _v, ...baseClean } = initialPolicyRules;
+        const elevatedRules = { ...baseClean, hard_cap_minor: toMinorUnits(75000) };
+        const elevatedHash = computeProposalHash(1, elevatedRules);
+        const legacyProposalId = 'prop-preexisting-over-cap';
+        const nowIso = new Date().toISOString();
+
+        repos.policyProposals.insert({
+          id: legacyProposalId,
+          base_version: 1,
+          rules: JSON.stringify(elevatedRules),
+          proposal_hash: elevatedHash,
+          has_relaxations: 1,
+          relaxations: JSON.stringify(['Hard cap ceiling increased']),
+          diff: JSON.stringify([]),
+          explanation: 'Legacy proposal created under higher ceiling',
+          unsupported_requests: '[]',
+          owner_id: 'default',
+          status: 'PENDING',
+          created_at: nowIso,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          activated_at: null,
+          rejected_at: null,
+        });
+
+        for (const [path, body] of [
+          ['/api/policies/activate', { proposalId: legacyProposalId, proposalHash: elevatedHash, acknowledgeRelaxations: true }],
+          [`/api/policies/drafts/${legacyProposalId}/activate`, { proposalHash: elevatedHash, acknowledgeRelaxations: true }],
+          ['/api/policies', { proposalId: legacyProposalId, proposalHash: elevatedHash, acknowledgeRelaxations: true }],
+        ] as const) {
+          const actRes = await fetch(`http://127.0.0.1:${started.port}${path}`, {
+            method: 'POST',
+            headers: {
+              Cookie: capCookie,
+              'x-csrf-token': capCsrf,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+          });
+          expect(actRes.status).toBe(400);
+          const actData = (await actRes.json()) as { error: string; details?: { max_hard_cap_minor?: number } };
+          expect(actData.error).toBe('RULE_CONSTRAINT_VIOLATION');
+          expect(actData.details?.max_hard_cap_minor).toBe(50000);
+          expect(repos.policyProposals.getById(legacyProposalId)?.status).toBe('PENDING');
+          expect(repos.policyVersions.getActive()?.version).toBe(1);
+        }
+
+        // 4. Direct POST /api/policies enforces ceiling on manual policy updates
+        const manualOverRes = await fetch(`http://127.0.0.1:${started.port}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: capCookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ...baseClean, hard_cap_minor: 50001 }),
+        });
+        expect(manualOverRes.status).toBe(400);
+        expect(repos.policyVersions.getActive()?.version).toBe(1);
+
+        const manualBoundaryRes = await fetch(`http://127.0.0.1:${started.port}/api/policies`, {
+          method: 'POST',
+          headers: {
+            Cookie: capCookie,
+            'x-csrf-token': capCsrf,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ...baseClean, hard_cap_minor: 50000 }),
+        });
+        expect(manualBoundaryRes.status).toBe(201);
+        expect(repos.policyVersions.getActive()?.version).toBe(2);
+      } finally {
+        await cappedServer.close();
       }
     });
   });

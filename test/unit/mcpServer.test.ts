@@ -18,7 +18,7 @@
  *   10. Idle session eviction cleans up expired sessions without resource leaks.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as crypto from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -27,6 +27,9 @@ import { Repositories } from '../../src/db/repositories.js';
 import { createPayGuardMcpServer, type PayGuardMcpServerInstance } from '../../src/mcp/server.js';
 import { generateAgentKey } from '../../src/mcp/auth.js';
 import { toMinorUnits } from '../../src/core/money.js';
+import { loadConfig } from '../../src/config/index.js';
+import { decryptReplyMarkup } from '../../src/telegram/crypto.js';
+import type { TelegramClient } from '../../src/telegram/client.js';
 import type { AgentRow } from '../../src/db/types.js';
 
 describe('M3-T2: MCP Server Skeleton & Per-Session Security Isolation', () => {
@@ -541,6 +544,250 @@ describe('M3-T2: MCP Server Skeleton & Per-Session Security Isolation', () => {
 
       expect(customServer.holdExpiryWorker.isRunning()).toBe(false);
       expect(customServer.reconcilerWorker.isRunning()).toBe(false);
+    });
+
+    it('6. Passes db to NotificationOutboxWorker so exhausted/invalid terminal re-attestation persists audit log', async () => {
+      const nowIso = new Date().toISOString();
+      const linkedAt = nowIso;
+
+      repos.owners.upsert({
+        id: 'default',
+        display_name: 'Owner',
+        passphrase_hash: 'hash',
+        telegram_chat_id: '11223344',
+        telegram_user_id: '11223344',
+        telegram_linked_at: linkedAt,
+        created_at: nowIso,
+      });
+
+      const { agent } = seedAgent({ id: 'agent-outbox-audit' });
+      repos.vendors.insert({
+        id: 'ven-outbox-audit',
+        name: 'Audit Vendor',
+        status: 'ACTIVE',
+        categories: JSON.stringify(['cloud']),
+        currencies: JSON.stringify(['USD']),
+        connector_key: 'audit_vendor',
+        created_at: nowIso,
+      });
+      repos.policyVersions.insert({
+        id: 'pol-outbox-audit',
+        version: 1,
+        rules: JSON.stringify({
+          version: 1,
+          currency_allowlist: ['USD'],
+          auto_limit_minor: toMinorUnits(2500),
+          hard_cap_minor: toMinorUnits(10000),
+          agent_daily_budget_minor: toMinorUnits(10000),
+          global_daily_budget_minor: toMinorUnits(50000),
+          velocity: { max_requests: 5, window_minutes: 10 },
+          duplicate_window_minutes: 60,
+          new_vendor_action: 'HOLD',
+          hold_ttl_minutes: 15,
+        }),
+        author: 'owner',
+        active: 1,
+        created_at: nowIso,
+      });
+      repos.paymentRequests.insert({
+        id: 'req-reattest-audit',
+        agent_id: agent.id,
+        idempotency_key: 'idem-reattest-audit',
+        vendor_id: 'ven-outbox-audit',
+        amount_minor: toMinorUnits(1500),
+        currency: 'USD',
+        purpose: 'Test outbox db wiring',
+        category: null,
+        source_context_excerpt: null,
+        source_context_hash: null,
+        status: 'CAPTURED',
+        decision: 'ALLOW',
+        reasons: null,
+        policy_version_id: 'pol-outbox-audit',
+        snapshot_hash: null,
+        paypal_order_id: null,
+        paypal_authorization_id: null,
+        paypal_capture_id: null,
+        expires_at: null,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+
+      // Terminal re-attestation row without valid telegram_message_id triggers immediate exhaustion & audit log
+      repos.notifications.enqueue({
+        id: 'out-reattest-missing-msgid',
+        owner_id: 'default',
+        request_id: 'req-reattest-audit',
+        event_type: 'PAYMENT_CAPTURED',
+        dedup_key: 'terminal_reattest:req-reattest-audit:p1',
+        recipient_chat_id: '11223344',
+        linked_at: linkedAt,
+        message_text: 'Terminal re-attestation',
+        parse_mode: 'HTML',
+        reply_markup_enc: null,
+        telegram_message_id: null,
+        max_attempts: 3,
+        next_attempt_at: nowIso,
+        created_at: nowIso,
+      });
+
+      const mockTgClient = {
+        sendMessage: vi.fn(),
+        editMessageText: vi.fn(),
+      } as unknown as TelegramClient;
+
+      const tgConfig = loadConfig({
+        NODE_ENV: 'test',
+        SESSION_SECRET: 'test-secret-at-least-32-chars-long-1234',
+        TELEGRAM_MODE: 'webhook',
+        TELEGRAM_BOT_TOKEN: '123456:ABC',
+      });
+
+      const tgServer = createPayGuardMcpServer({
+        db,
+        repos,
+        config: tgConfig,
+        telegramClient: mockTgClient,
+        notificationOutboxWorkerIntervalMs: 60_000,
+      });
+
+      expect(tgServer.notificationOutboxWorker).toBeDefined();
+      const processed = await tgServer.notificationOutboxWorker!.tick();
+      expect(processed).toBe(1);
+
+      const updatedOutbox = repos.notifications.getById('out-reattest-missing-msgid');
+      expect(updatedOutbox?.status).toBe('DEAD');
+
+      const exhaustedAudit = repos.auditLog
+        .list()
+        .find((a) => a.event === 'TELEGRAM_TERMINAL_RE_ATTESTATION_EXHAUSTED');
+      expect(exhaustedAudit).toBeDefined();
+      expect(exhaustedAudit?.request_id).toBe('req-reattest-audit');
+
+      await tgServer.close();
+    });
+
+    it('7. MCP request_payment forwards config publicBaseUrl, isProduction, and telegramEncryptionKey', async () => {
+      const nowIso = new Date().toISOString();
+      const encKey = crypto.randomBytes(32).toString('hex');
+
+      repos.owners.upsert({
+        id: 'default',
+        display_name: 'Owner',
+        passphrase_hash: 'hash',
+        telegram_chat_id: '99112233',
+        telegram_user_id: '99112233',
+        telegram_linked_at: nowIso,
+        created_at: nowIso,
+      });
+
+      const { rawKey } = seedAgent({
+        id: 'agent-mcp-cfg',
+        daily_budget_minor: toMinorUnits(20000),
+      });
+
+      repos.vendors.insert({
+        id: 'ven-mcp-cfg',
+        name: 'Unverified MCP Vendor',
+        status: 'UNVERIFIED',
+        categories: JSON.stringify(['cloud']),
+        currencies: JSON.stringify(['USD']),
+        connector_key: 'unverified_mcp_vendor',
+        created_at: nowIso,
+      });
+
+      repos.policyVersions.insert({
+        id: 'pol-mcp-cfg',
+        version: 1,
+        rules: JSON.stringify({
+          version: 1,
+          currency_allowlist: ['USD'],
+          auto_limit_minor: toMinorUnits(2500),
+          hard_cap_minor: toMinorUnits(10000),
+          agent_daily_budget_minor: toMinorUnits(20000),
+          global_daily_budget_minor: toMinorUnits(50000),
+          velocity: { max_requests: 10, window_minutes: 10 },
+          duplicate_window_minutes: 60,
+          new_vendor_action: 'HOLD',
+          hold_ttl_minutes: 15,
+        }),
+        author: 'owner',
+        active: 1,
+        created_at: nowIso,
+      });
+
+      const prodCfg = loadConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'prod-secret-at-least-32-chars-long-1234',
+        PUBLIC_BASE_URL: 'https://guard.prod.example/',
+        TELEGRAM_MODE: 'webhook',
+        TELEGRAM_BOT_TOKEN: '123456:ABC',
+        TELEGRAM_ENCRYPTION_KEY: encKey,
+      });
+
+      const cfgServer = createPayGuardMcpServer({
+        db,
+        repos,
+        config: prodCfg,
+        telegramClient: { sendMessage: vi.fn() } as unknown as TelegramClient,
+        secureCookie: false,
+      });
+
+      const started = await cfgServer.start(0);
+      try {
+        const transport = new StreamableHTTPClientTransport(
+          new URL(`http://localhost:${started.port}/mcp`),
+          {
+            requestInit: {
+              headers: {
+                Authorization: `Bearer ${rawKey}`,
+              },
+            },
+          }
+        );
+        const client = new Client({ name: 'test-cfg-client', version: '1.0.0' });
+        await client.connect(transport);
+
+        const toolRes = await client.callTool({
+          name: 'request_payment',
+          arguments: {
+            vendor_id: 'ven-mcp-cfg',
+            amount: '30.00',
+            currency: 'USD',
+            purpose: 'Config forwarding over MCP',
+            idempotency_key: 'idem-mcp-cfg-1',
+          },
+        });
+
+        const parsed = JSON.parse(
+          (toolRes.content as Array<{ text: string }>)[0]!.text
+        ) as { request_id: string; status: string };
+        expect(parsed.status).toBe('HELD');
+
+        const outboxRow = repos.notifications.getByDedupKey(`payment_held:${parsed.request_id}`)!;
+        expect(outboxRow).toBeDefined();
+        expect(outboxRow.message_text).toContain(
+          `href="https://guard.prod.example/#/requests/${parsed.request_id}"`
+        );
+        expect(outboxRow.reply_markup_enc).toBeTruthy();
+
+        const decrypted = decryptReplyMarkup(
+          outboxRow.reply_markup_enc!,
+          {
+            outboxId: outboxRow.id,
+            ownerId: outboxRow.owner_id,
+            requestId: parsed.request_id,
+            recipientChatId: outboxRow.recipient_chat_id,
+            linkedAt: outboxRow.linked_at,
+          },
+          encKey
+        );
+        expect(decrypted.inline_keyboard[0]).toHaveLength(2);
+
+        await client.close();
+      } finally {
+        await started.close();
+      }
     });
   });
 });

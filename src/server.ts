@@ -135,18 +135,29 @@ export async function startServer(options: StandaloneServerOptions = {}): Promis
       ordersService,
       authorizationsService,
       defaultVaultTokenId: config.vaultTokenId,
-      holdExpiryWorkerIntervalMs: config.holdTtlMinutes * 60 * 1000,
       config,
       trustProxy: config.trustProxy,
       logger,
     });
+
+    if (config.trustProxy === true && config.nodeEnv === 'production') {
+      logger.warn(
+        '[Security] Warning: TRUST_PROXY is set to true in production. This trusts all proxy headers and is vulnerable to IP spoofing. Prefer an explicit hop count (e.g. 1) or trusted CIDR matching your topology.'
+      );
+    }
 
     // 8. Start HTTP listener & background workers (HoldExpiryWorker & ReconcilerWorker) exactly once (Requirement 4 & 5)
     const serverResult = await mcpServer.start(targetPort);
     const resolvedPort = serverResult.port;
 
     logger.info(`[PayGuard] HTTP server listening on port ${resolvedPort}`);
-    logger.info(`[PayGuard] Public base URL: ${config.publicBaseUrl}`);
+    if (config.publicBaseUrl) {
+      logger.info(`[PayGuard] Public base URL: ${config.publicBaseUrl}`);
+    } else {
+      logger.warn(
+        '[PayGuard] PUBLIC_BASE_URL is not configured in production; dashboard links in notifications are disabled.'
+      );
+    }
 
     // 9. Idempotent graceful shutdown function (Requirement 7, 8, 9)
     const activeDb = db;

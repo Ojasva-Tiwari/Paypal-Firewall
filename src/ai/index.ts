@@ -14,7 +14,7 @@ import {
   DEFAULT_GEMINI_MODEL,
 } from './types.js';
 import { MockAiProvider } from './mockProvider.js';
-import { GeminiProvider } from './geminiProvider.js';
+import { GeminiProvider, DEFAULT_GEMINI_TIMEOUT_MS } from './geminiProvider.js';
 import { AiRateLimiter } from './rateLimiter.js';
 import { AiService } from './service.js';
 
@@ -45,7 +45,7 @@ export function createAiProvider(
     return new GeminiProvider({
       apiKey: config.geminiApiKey.trim(),
       modelName: config.aiModel || DEFAULT_GEMINI_MODEL,
-      timeoutMs: 10_000,
+      timeoutMs: DEFAULT_GEMINI_TIMEOUT_MS,
       maxRetries: 1,
     });
   }

@@ -44,7 +44,7 @@ describe('M4-T4: Hold Expiry Worker & Stale Hold Invariants', () => {
     db = createDatabase(':memory:');
     runMigrations(db);
     repos = new Repositories(db);
-    sessionStore = new OwnerSessionStore();
+    sessionStore = new OwnerSessionStore({ db, repos });
 
     // 1. Seed Owner
     repos.owners.upsert({
@@ -583,8 +583,65 @@ describe('M4-T4: Hold Expiry Worker & Stale Hold Invariants', () => {
       expect(tickResult.totalExpired).toBe(1);
       expect(repos.paymentRequests.getById(requestId)?.status).toBe('VOIDED');
 
-      worker.stop();
+      await worker.stop();
       expect(worker.isRunning()).toBe(false);
+      expect(worker.getIntervalMs()).toBe(100);
+    });
+
+    it('HoldExpiryWorker.stop() awaits in-flight PayPal voidAuthorization HTTP call and blocks subsequent ticks', async () => {
+      let releaseVoid!: () => void;
+      const voidStarted = new Promise<void>((resolve) => {
+        vi.mocked(mockAuthorizationsService.voidAuthorization).mockImplementation(async (input) => {
+          resolve();
+          await new Promise<void>((r) => {
+            releaseVoid = r;
+          });
+          return {
+            id: input.authorizationId,
+            status: 'VOIDED',
+            isVoided: true,
+          };
+        });
+      });
+
+      const worker = new HoldExpiryWorker({
+        db,
+        repos,
+        authorizationsService: mockAuthorizationsService,
+        intervalMs: 100,
+      });
+
+      const { requestId: req1 } = seedHeldPaymentRequest();
+      const { requestId: req2 } = seedHeldPaymentRequest();
+      expireHoldInDb(req1);
+      expireHoldInDb(req2);
+
+      worker.start();
+      const inFlightTick = worker.tick();
+      await voidStarted;
+
+      let stopResolved = false;
+      const stopPromise = worker.stop().then(() => {
+        stopResolved = true;
+      });
+
+      // stop() must wait until in-flight PayPal HTTP call and post-HTTP DB writes complete
+      await new Promise((r) => setTimeout(r, 30));
+      expect(stopResolved).toBe(false);
+      expect(worker.isRunning()).toBe(false);
+
+      // New ticks invoked after shutdown begins must no-op cleanly
+      const skippedTick = await worker.tick();
+      expect(skippedTick.totalDiscovered).toBe(0);
+
+      releaseVoid();
+      const [tickRes] = await Promise.all([inFlightTick, stopPromise]);
+      expect(stopResolved).toBe(true);
+
+      // req1 completed its remote_void_status update; req2 was skipped due to shutdown checkpoint
+      expect(tickRes.totalExpired).toBe(1);
+      expect(repos.paymentRequests.getById(req1)?.remote_void_status).toBe('CONFIRMED');
+      expect(repos.paymentRequests.getById(req2)?.status).toBe('HELD');
     });
   });
 });

@@ -51,6 +51,14 @@ describe('M5-T3: AI Risk Explanations', () => {
     runMigrations(db);
     repos = new Repositories(db);
 
+    repos.owners.upsert({
+      id: 'default',
+      display_name: 'Test Owner',
+      passphrase_hash: 'test-hash',
+      telegram_chat_id: null,
+      created_at: new Date().toISOString(),
+    });
+
     // Seed agent and vendor
     repos.agents.insert({
       id: 'agent_test_01',
@@ -647,9 +655,9 @@ describe('M5-T3: AI Risk Explanations', () => {
     let baseUrl: string;
 
     beforeEach(async () => {
-      sessionStore = new OwnerSessionStore();
+      sessionStore = new OwnerSessionStore({ db, repos });
       const session = sessionStore.createSession({
-        id: 'owner_admin',
+        id: 'default',
         displayName: 'Test Owner',
       });
       validSessionCookie = `${OWNER_COOKIE_NAME}=${session.rawSessionToken}`;
@@ -771,9 +779,9 @@ describe('M5-T3: AI Risk Explanations', () => {
     let baseUrl: string;
 
     beforeEach(async () => {
-      sessionStore = new OwnerSessionStore();
+      sessionStore = new OwnerSessionStore({ db, repos });
       const session = sessionStore.createSession({
-        id: 'owner_admin',
+        id: 'default',
         displayName: 'Test Owner',
       });
       validSessionCookie = `${OWNER_COOKIE_NAME}=${session.rawSessionToken}`;
@@ -1062,7 +1070,7 @@ describe('M5-T3: AI Risk Explanations', () => {
 
       // Mint owner session
       const ownerSession = testServerInstance.ownerSessionStore.createSession({
-        id: 'owner_test',
+        id: 'default',
         displayName: 'Owner Tester',
       });
       const cookieHeader = `${OWNER_COOKIE_NAME}=${ownerSession.rawSessionToken}`;
@@ -1151,7 +1159,7 @@ describe('M5-T3: AI Risk Explanations', () => {
       });
 
       const ownerSession = testServerInstance.ownerSessionStore.createSession({
-        id: 'owner_shared',
+        id: 'default',
         displayName: 'Owner Shared',
       });
       const cookieHeader = `${OWNER_COOKIE_NAME}=${ownerSession.rawSessionToken}`;

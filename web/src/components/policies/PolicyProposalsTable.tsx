@@ -95,7 +95,7 @@ export function PolicyProposalsTable({
             <TableHeader>
               <TableRow>
                 <TableHead>Proposal ID</TableHead>
-                <TableHead>Base $\to$ Target</TableHead>
+                <TableHead>Base → Target</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Diff Analysis</TableHead>
                 <TableHead>Created</TableHead>
@@ -124,7 +124,7 @@ export function PolicyProposalsTable({
                         {item.id}
                       </TableCell>
                       <TableCell className="font-mono text-xs">
-                        v{item.baseVersion} $\to$ v{item.baseVersion + 1}
+                        v{item.baseVersion} → v{item.baseVersion + 1}
                       </TableCell>
                       <TableCell>
                         <span

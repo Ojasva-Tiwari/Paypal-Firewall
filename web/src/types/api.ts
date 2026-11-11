@@ -55,6 +55,10 @@ export interface RecentActivityItem {
   currency: string;
   agentId: string;
   agentName: string;
+  paypalOrderId?: string | null;
+  paypalAuthorizationId?: string | null;
+  paypalCaptureId?: string | null;
+  remoteVoidStatus?: 'PENDING' | 'CONFIRMED' | 'FAILED' | null;
 }
 
 export interface OverviewResponse {
@@ -77,7 +81,12 @@ export interface PaymentRequestSummary {
   status: string;
   decision: string | null;
   reasons: string[];
+  paypalOrderId?: string | null;
+  paypalAuthorizationId?: string | null;
+  paypalCaptureId?: string | null;
+  remoteVoidStatus?: 'PENDING' | 'CONFIRMED' | 'FAILED' | null;
   createdAt: string;
+  updatedAt?: string;
   expiresAt: string | null;
 }
 
@@ -370,5 +379,30 @@ export interface RejectProposalResponse {
   rejectedAt: string;
   reason: string;
 }
+
+export type TelegramMode = 'disabled' | 'webhook';
+
+export interface TelegramStatusResponse {
+  configured: boolean;
+  mode: TelegramMode;
+  botUsername: string | null;
+  linked: boolean;
+  chatId: string | null;
+  username: string | null;
+  linkedAt: string | null;
+}
+
+export interface TelegramLinkTokenResponse {
+  success: boolean;
+  deepLink: string;
+  expiresAt: string;
+  ttlSeconds: number;
+}
+
+export interface TelegramUnlinkResponse {
+  success: boolean;
+  message: string;
+}
+
 
 

@@ -269,6 +269,49 @@ export function PaymentDetailPage({ requestId, onBack }: PaymentDetailPageProps)
       {/* Main Request Detail Content */}
       {detail && (
         <div className="space-y-6">
+          {/* Unresolved Execution or Remote Void Banner */}
+          {(detail.status === 'AUTO_EXECUTING' ||
+            detail.status === 'APPROVED' ||
+            detail.status === 'CAPTURING' ||
+            detail.remoteVoidStatus === 'PENDING' ||
+            detail.remoteVoidStatus === 'FAILED') && (
+            <div
+              className={`rounded-2xl p-4 border flex items-start gap-2.5 text-xs ${
+                detail.remoteVoidStatus === 'FAILED'
+                  ? 'bg-[var(--status-error-bg)] border-[var(--status-error-border)] text-[var(--text-primary)]'
+                  : detail.remoteVoidStatus === 'PENDING'
+                  ? 'bg-[var(--status-warn-bg)] border-[var(--status-warn-border)] text-[var(--text-primary)]'
+                  : 'bg-[var(--accent-lavender)]/10 border-[var(--accent-lavender)]/30 text-[var(--text-primary)]'
+              }`}
+            >
+              <AlertTriangle
+                className={`h-5 w-5 shrink-0 mt-0.5 ${
+                  detail.remoteVoidStatus === 'FAILED'
+                    ? 'text-[var(--status-error)]'
+                    : detail.remoteVoidStatus === 'PENDING'
+                    ? 'text-[var(--status-warn)]'
+                    : 'text-[var(--accent-lavender)]'
+                }`}
+              />
+              <div className="space-y-0.5">
+                <span className="font-semibold block">
+                  {detail.remoteVoidStatus === 'FAILED'
+                    ? 'Remote PayPal Void Failed (Local Budget Released)'
+                    : detail.remoteVoidStatus === 'PENDING'
+                    ? 'Remote PayPal Void Pending Reconciliation'
+                    : `Payment ${detail.status.replace('_', ' ')} — Awaiting PayPal Reconciliation`}
+                </span>
+                <p className="text-[var(--text-secondary)]">
+                  {detail.remoteVoidStatus === 'FAILED'
+                    ? 'The local hold is voided and the agent budget reservation has been released, but canceling the PayPal sandbox authorization failed or lacks an authorization ID. Review PayPal sandbox status or audit timeline.'
+                    : detail.remoteVoidStatus === 'PENDING'
+                    ? 'The local hold is voided and the agent budget reservation has been released. Background reconciliation is still confirming remote PayPal authorization cancellation.'
+                    : 'Local payment execution is in an intermediate state and protected from duplicate capture while PayPal sandbox reconciliation completes.'}
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Header Card: ID, Status, Amount, Actions */}
           <div className="rounded-2xl bg-[var(--card-bg)] border border-[var(--border-color)] p-6 space-y-6 shadow-sm">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-5 border-b border-[var(--border-color)]">
@@ -603,7 +646,17 @@ export function PaymentDetailPage({ requestId, onBack }: PaymentDetailPageProps)
                 {detail.remoteVoidStatus && (
                   <div className="p-3 rounded-xl bg-[var(--elevated-bg)] border border-[var(--border-color)]">
                     <span className="text-[var(--text-secondary)] block text-[10px] uppercase">Remote Void Status</span>
-                    <span className="text-[var(--text-primary)] font-semibold">{detail.remoteVoidStatus}</span>
+                    <span
+                      className={`font-semibold ${
+                        detail.remoteVoidStatus === 'CONFIRMED'
+                          ? 'text-[var(--accent-sage)]'
+                          : detail.remoteVoidStatus === 'PENDING'
+                          ? 'text-[var(--status-warn)]'
+                          : 'text-[var(--status-error)]'
+                      }`}
+                    >
+                      {detail.remoteVoidStatus}
+                    </span>
                   </div>
                 )}
               </div>

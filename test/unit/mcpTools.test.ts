@@ -4,8 +4,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as crypto from 'node:crypto';
 import { createDatabase, runMigrations, type Database } from '../../src/db/connection.js';
 import { Repositories } from '../../src/db/repositories.js';
+import { loadConfig } from '../../src/config/index.js';
+import { decryptReplyMarkup } from '../../src/telegram/crypto.js';
 import { agentContextStorage, generateAgentKey } from '../../src/mcp/auth.js';
 import {
   handleRequestPayment,
@@ -744,6 +747,110 @@ describe('M3-T3: Four Core MCP Tool Handlers & Security Invariants', () => {
       expect(res.status).toBe(400);
       const body = (await res.json()) as { error: { message: string } };
       expect(body.error.message).toContain('Parse Error');
+    });
+  });
+
+  // ============================================================================
+  // 6. Configuration Forwarding from MCP Tools (Task A)
+  // ============================================================================
+
+  describe('6. Configuration Forwarding (publicBaseUrl, isProduction, telegramEncryptionKey)', () => {
+    it('forwards config.publicBaseUrl and config.telegramEncryptionKey in handleRequestPayment', async () => {
+      const encKey = crypto.randomBytes(32).toString('hex');
+      repos.owners.upsert({
+        id: 'default',
+        display_name: 'Owner',
+        passphrase_hash: 'hash',
+        telegram_chat_id: '555444333',
+        telegram_user_id: '555444333',
+        telegram_linked_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      });
+
+      const cfg = loadConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'prod-secret-min-32-chars-for-config-test',
+        PUBLIC_BASE_URL: 'https://guard.company.com/',
+        TELEGRAM_MODE: 'webhook',
+        TELEGRAM_BOT_TOKEN: '123456:ABC',
+        TELEGRAM_ENCRYPTION_KEY: encKey,
+      });
+
+      await runAsAgent(defaultAgent, async () => {
+        const res = await handleRequestPayment(
+          db,
+          {
+            vendor_id: 'ven-newbie', // UNVERIFIED -> HOLD without needing PayPal auth
+            amount: '35.00',
+            currency: 'USD',
+            purpose: 'Verify MCP tool config forwarding',
+            idempotency_key: 'idem-mcp-cfg-fwd-1',
+          },
+          repos,
+          { config: cfg }
+        );
+
+        const body = JSON.parse(getText(res)) as { request_id: string; status: string };
+        expect(body.status).toBe('HELD');
+
+        const outboxRow = repos.notifications.getByDedupKey(`payment_held:${body.request_id}`)!;
+        expect(outboxRow).toBeDefined();
+        expect(outboxRow.message_text).toContain(`href="https://guard.company.com/#/requests/${body.request_id}"`);
+        expect(outboxRow.reply_markup_enc).toBeTruthy();
+
+        const decrypted = decryptReplyMarkup(
+          outboxRow.reply_markup_enc!,
+          {
+            outboxId: outboxRow.id,
+            ownerId: outboxRow.owner_id,
+            requestId: body.request_id,
+            recipientChatId: outboxRow.recipient_chat_id,
+            linkedAt: outboxRow.linked_at,
+          },
+          encKey
+        );
+        expect(decrypted.inline_keyboard[0]).toHaveLength(2);
+      });
+    });
+
+    it('suppresses localhost URLs when config.isProduction is true and publicBaseUrl is omitted', async () => {
+      repos.owners.upsert({
+        id: 'default',
+        display_name: 'Owner',
+        passphrase_hash: 'hash',
+        telegram_chat_id: '555444333',
+        telegram_user_id: '555444333',
+        telegram_linked_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      });
+
+      const prodCfgNoUrl = loadConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'prod-secret-min-32-chars-for-config-test',
+      });
+      expect(prodCfgNoUrl.publicBaseUrl).toBeUndefined();
+
+      await runAsAgent(defaultAgent, async () => {
+        const res = await handleRequestPayment(
+          db,
+          {
+            vendor_id: 'ven-newbie',
+            amount: '35.00',
+            currency: 'USD',
+            purpose: 'Production dashboard URL check',
+            idempotency_key: 'idem-mcp-cfg-prod-nourl',
+          },
+          repos,
+          { config: prodCfgNoUrl }
+        );
+
+        const body = JSON.parse(getText(res)) as { request_id: string; status: string };
+        expect(body.status).toBe('HELD');
+
+        const outboxRow = repos.notifications.getByDedupKey(`payment_held:${body.request_id}`)!;
+        expect(outboxRow.message_text).not.toContain('http://localhost');
+        expect(outboxRow.message_text).not.toContain('href=');
+      });
     });
   });
 });

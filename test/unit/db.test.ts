@@ -33,11 +33,11 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
   });
 
   describe('Database Initialization & Migrations', () => {
-    it('should create all 10 canonical Section 8 tables on empty database', () => {
+    it('should create all canonical tables on empty database', () => {
       const freshDb = createDatabase(':memory:');
       const count = runMigrations(freshDb);
 
-      expect(count).toBe(6);
+      expect(count).toBe(12);
 
       const tables = freshDb
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC")
@@ -57,6 +57,10 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       expect(tableNames).toContain('audit_log');
       expect(tableNames).toContain('ai_runs');
       expect(tableNames).toContain('policy_proposals');
+      expect(tableNames).toContain('telegram_link_tokens');
+      expect(tableNames).toContain('notification_outbox');
+      expect(tableNames).toContain('telegram_approval_callbacks');
+      expect(tableNames).toContain('owner_sessions');
 
       freshDb.close();
     });
@@ -83,6 +87,20 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       expect(indexNames).toContain('idx_audit_log_request_id');
       expect(indexNames).toContain('idx_policy_versions_single_active');
       expect(indexNames).toContain('idx_policy_versions_version');
+      expect(indexNames).toContain('idx_telegram_link_tokens_hash');
+      expect(indexNames).toContain('idx_telegram_link_tokens_owner_expires');
+      expect(indexNames).toContain('idx_owners_telegram_chat_id');
+      expect(indexNames).toContain('idx_notification_outbox_pending');
+      expect(indexNames).toContain('idx_notification_outbox_processing');
+      expect(indexNames).toContain('idx_notification_outbox_request');
+      expect(indexNames).toContain('idx_notification_outbox_owner');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_hash');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_request');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_owner');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_expires');
+      expect(indexNames).toContain('idx_owner_sessions_owner_id');
+      expect(indexNames).toContain('idx_owner_sessions_last_accessed');
+      expect(indexNames).toContain('idx_owner_sessions_created_at');
     });
   });
 
@@ -477,6 +495,23 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
 
       const token = repos.vendorVaultTokens.getByVendorId('ven-acme');
       expect(token?.vault_token_id).toBe('tok-sandbox-example-0002');
+
+      // REVOKED tokens must be excluded by getByVendorId
+      repos.vendorVaultTokens.updateStatus('vvt-1', 'REVOKED');
+      expect(repos.vendorVaultTokens.getByVendorId('ven-acme')).toBeUndefined();
+      expect(repos.vendorVaultTokens.listByVendorId('ven-acme')).toHaveLength(1);
+
+      // New active replacement becomes the resolved token while revoked history remains
+      repos.vendorVaultTokens.insert({
+        id: 'vvt-2',
+        vendor_id: 'ven-acme',
+        paypal_customer_ref: 'cust-123',
+        vault_token_id: 'tok-sandbox-example-0003',
+        status: 'VAULTED',
+        created_at: new Date().toISOString(),
+      });
+      expect(repos.vendorVaultTokens.getByVendorId('ven-acme')?.vault_token_id).toBe('tok-sandbox-example-0003');
+      expect(repos.vendorVaultTokens.listByVendorId('ven-acme')).toHaveLength(2);
     });
 
     it('should manage ledger entries and payment request updates', () => {
@@ -718,13 +753,13 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
   });
 
   describe('Migration 6 Upgrade Compatibility & Trigger Hardening', () => {
-    it('should produce identical trigger definitions on fresh database (1-6) vs upgraded database (1-5 then 6)', () => {
-      // Path A: Fresh database running all migrations 1..6
+    it('should produce identical trigger definitions on fresh database (1-12) vs upgraded database (1-5 then 6+)', () => {
+      // Path A: Fresh database running all migrations 1..12
       const freshDb = createDatabase(':memory:');
       const freshCount = runMigrations(freshDb);
-      expect(freshCount).toBe(6);
+      expect(freshCount).toBe(12);
 
-      // Path B: Existing database running migrations 1..5 first, then upgrading to 6
+      // Path B: Existing database running migrations 1..5 first, then upgrading to latest
       const upgradedDb = createDatabase(':memory:');
       upgradedDb.exec(`
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -747,12 +782,12 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
       const appliedBefore = upgradedDb.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
       expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5]);
 
-      // Run runMigrations on upgradedDb to apply Migration 6
+      // Run runMigrations on upgradedDb to apply Migrations 6..12
       const upgradeCount = runMigrations(upgradedDb);
-      expect(upgradeCount).toBe(1);
+      expect(upgradeCount).toBe(7);
 
       const appliedAfter = upgradedDb.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
-      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
       // Compare trigger definitions between freshDb and upgradedDb
       const getTriggers = (database: typeof freshDb) =>
@@ -842,9 +877,9 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run('aud-pre-6', nowIso, 'owner', 'POLICY_PROPOSAL_CREATED', null, '{}', null, 'hash-aud-1');
 
-      // Now run migration runner to upgrade from 5 to 6
+      // Now run migration runner to upgrade from 5 to latest (Migrations 6..12)
       const appliedCount = runMigrations(dbAtV5);
-      expect(appliedCount).toBe(1);
+      expect(appliedCount).toBe(7);
 
       // Verify proposal survived untouched
       interface ProposalRow {
@@ -919,8 +954,451 @@ describe('SQLite Database Schema, Migrations, and Repositories (M1-T2)', () => {
 
       const v6Count = dbAtV5.prepare('SELECT COUNT(*) as count FROM schema_migrations WHERE version = 6').get() as { count: number };
       expect(v6Count.count).toBe(1);
+      const v7Count = dbAtV5.prepare('SELECT COUNT(*) as count FROM schema_migrations WHERE version = 7').get() as { count: number };
+      expect(v7Count.count).toBe(1);
+      const v8Count = dbAtV5.prepare('SELECT COUNT(*) as count FROM schema_migrations WHERE version = 8').get() as { count: number };
+      expect(v8Count.count).toBe(1);
 
       dbAtV5.close();
+    });
+  });
+
+  describe('Migration 7 Upgrade Compatibility & Telegram Link Tokens', () => {
+    it('should apply Migration 7 cleanly on existing v6 database and support link tokens', () => {
+      // 1. Build database up to v6
+      const dbAtV6 = createDatabase(':memory:');
+      dbAtV6.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 6)) {
+        dbAtV6.transaction(() => {
+          dbAtV6.exec(migration.up);
+          dbAtV6.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Populate pre-existing owner row (schema before Migration 7)
+      const nowIso = new Date().toISOString();
+      dbAtV6.prepare(`
+        INSERT INTO owners (id, display_name, passphrase_hash, telegram_chat_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('default', 'Primary Owner', 'pw_hash', '12345678', nowIso);
+
+      // Verify v6 state
+      const appliedBefore = dbAtV6.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6]);
+
+      // Run runMigrations to apply Migrations 7..12
+      const upgradeCount = runMigrations(dbAtV6);
+      expect(upgradeCount).toBe(6);
+
+      const appliedAfter = dbAtV6.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify telegram_link_tokens table was created
+      const tables = dbAtV6.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'telegram_link_tokens'").all();
+      expect(tables.length).toBe(1);
+
+      // Verify telegram_link_tokens indices
+      const indexes = dbAtV6.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'telegram_link_tokens'").all() as Array<{ name: string }>;
+      const indexNames = indexes.map((i) => i.name);
+      expect(indexNames).toContain('idx_telegram_link_tokens_hash');
+      expect(indexNames).toContain('idx_telegram_link_tokens_owner_expires');
+
+      // Verify pre-existing owner survived and gained telegram_username and telegram_linked_at (null)
+      interface OwnerRowExtended {
+        id: string;
+        display_name: string;
+        telegram_chat_id: string | null;
+        telegram_username: string | null;
+        telegram_linked_at: string | null;
+      }
+      const owner = dbAtV6.prepare('SELECT id, display_name, telegram_chat_id, telegram_username, telegram_linked_at FROM owners WHERE id = ?').get('default') as OwnerRowExtended;
+      expect(owner).toBeDefined();
+      expect(owner.id).toBe('default');
+      expect(owner.display_name).toBe('Primary Owner');
+      expect(owner.telegram_chat_id).toBe('12345678');
+      expect(owner.telegram_username).toBeNull();
+      expect(owner.telegram_linked_at).toBeNull();
+
+      // Verify subsequent runMigrations is idempotent
+      const rerun = runMigrations(dbAtV6);
+      expect(rerun).toBe(0);
+
+      dbAtV6.close();
+    });
+  });
+
+  describe('Migration 8 Upgrade Compatibility & Global Chat ID Uniqueness', () => {
+    it('should apply Migration 8 cleanly on existing v7 database and enforce chat ID uniqueness', () => {
+      // 1. Build database up to v7
+      const dbAtV7 = createDatabase(':memory:');
+      dbAtV7.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 7)) {
+        dbAtV7.transaction(() => {
+          dbAtV7.exec(migration.up);
+          dbAtV7.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Populate pre-existing owner with a linked chat ID
+      const nowIso = new Date().toISOString();
+      dbAtV7.prepare(`
+        INSERT INTO owners (id, display_name, passphrase_hash, telegram_chat_id, telegram_username, telegram_linked_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('default', 'Primary Owner', 'pw_hash', '123456789', 'owner_alice', nowIso, nowIso);
+
+      // Verify v7 state
+      const appliedBefore = dbAtV7.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+
+      // Run runMigrations to apply Migrations 8..12
+      const upgradeCount = runMigrations(dbAtV7);
+      expect(upgradeCount).toBe(5);
+
+      const appliedAfter = dbAtV7.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify index idx_owners_telegram_chat_id exists on owners table
+      const ownerIndexes = dbAtV7.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'owners'").all() as Array<{ name: string }>;
+      expect(ownerIndexes.map((i) => i.name)).toContain('idx_owners_telegram_chat_id');
+
+      // Verify unique constraint: create a secondary owner table scenario (dropping check constraint for multi-owner test)
+      // Attempting to duplicate telegram_chat_id throws a unique constraint error
+      dbAtV7.exec(`
+        CREATE TABLE test_uniqueness_check (
+          id TEXT PRIMARY KEY,
+          telegram_chat_id TEXT
+        );
+        CREATE UNIQUE INDEX idx_test_unique_chat_id ON test_uniqueness_check(telegram_chat_id) WHERE telegram_chat_id IS NOT NULL;
+        INSERT INTO test_uniqueness_check (id, telegram_chat_id) VALUES ('owner1', '123456789');
+        INSERT INTO test_uniqueness_check (id, telegram_chat_id) VALUES ('owner2', NULL);
+        INSERT INTO test_uniqueness_check (id, telegram_chat_id) VALUES ('owner3', NULL);
+      `);
+
+      expect(() => {
+        dbAtV7.prepare("INSERT INTO test_uniqueness_check (id, telegram_chat_id) VALUES ('owner4', '123456789')").run();
+      }).toThrowError(/UNIQUE constraint failed/);
+
+      // Verify subsequent runMigrations is idempotent
+      const rerun = runMigrations(dbAtV7);
+      expect(rerun).toBe(0);
+
+      dbAtV7.close();
+    });
+  });
+
+  describe('Migration 9 Upgrade Compatibility & Notification Outbox', () => {
+    it('should apply Migration 9 cleanly on existing v8 database and verify outbox table and indexes', () => {
+      // 1. Build database up to v8
+      const dbAtV8 = createDatabase(':memory:');
+      dbAtV8.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 8)) {
+        dbAtV8.transaction(() => {
+          dbAtV8.exec(migration.up);
+          dbAtV8.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Verify v8 state
+      const appliedBefore = dbAtV8.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+
+      // Run runMigrations to apply Migrations 9..12
+      const upgradeCount = runMigrations(dbAtV8);
+      expect(upgradeCount).toBe(4);
+
+      const appliedAfter = dbAtV8.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify notification_outbox table exists
+      const tables = dbAtV8.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox'").all();
+      expect(tables.length).toBe(1);
+
+      // Verify indexes on notification_outbox
+      const indexes = dbAtV8.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'notification_outbox'").all() as Array<{ name: string }>;
+      const indexNames = indexes.map((i) => i.name);
+      expect(indexNames).toContain('idx_notification_outbox_pending');
+      expect(indexNames).toContain('idx_notification_outbox_processing');
+      expect(indexNames).toContain('idx_notification_outbox_request');
+      expect(indexNames).toContain('idx_notification_outbox_owner');
+
+      // Verify unique constraint on dedup_key
+      dbAtV8.prepare(`
+        INSERT INTO owners (id, display_name, passphrase_hash, telegram_chat_id, created_at)
+        VALUES ('default', 'Owner', 'hash', '123', datetime('now'))
+      `).run();
+
+      dbAtV8.prepare(`
+        INSERT INTO notification_outbox (
+          id, event_type, recipient_chat_id, owner_id, linked_at, request_id,
+          dedup_key, message_text, parse_mode, status, attempt_count, max_attempts,
+          next_attempt_at, created_at
+        ) VALUES (
+          'notif-1', 'PAYMENT_HELD', '123', 'default', datetime('now'), NULL,
+          'dedup-unique-1', 'Message 1', 'HTML', 'PENDING', 0, 3,
+          datetime('now'), datetime('now')
+        )
+      `).run();
+
+      expect(() => {
+        dbAtV8.prepare(`
+          INSERT INTO notification_outbox (
+            id, event_type, recipient_chat_id, owner_id, linked_at, request_id,
+            dedup_key, message_text, parse_mode, status, attempt_count, max_attempts,
+            next_attempt_at, created_at
+          ) VALUES (
+            'notif-2', 'PAYMENT_HELD', '123', 'default', datetime('now'), NULL,
+            'dedup-unique-1', 'Message 2', 'HTML', 'PENDING', 0, 3,
+            datetime('now'), datetime('now')
+          )
+        `).run();
+      }).toThrowError(/UNIQUE constraint failed/);
+
+      // Verify subsequent runMigrations is idempotent
+      const rerun = runMigrations(dbAtV8);
+      expect(rerun).toBe(0);
+
+      dbAtV8.close();
+    });
+  });
+
+  describe('Migration 10 Upgrade Compatibility & Telegram Approval Callbacks', () => {
+    it('should apply Migration 10 cleanly on existing v9 database and verify schema extensions', () => {
+      // 1. Build database up to v9
+      const dbAtV9 = createDatabase(':memory:');
+      dbAtV9.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 9)) {
+        dbAtV9.transaction(() => {
+          dbAtV9.exec(migration.up);
+          dbAtV9.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Verify v9 state
+      const appliedBefore = dbAtV9.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+      // Run runMigrations to apply Migrations 10..12
+      const upgradeCount = runMigrations(dbAtV9);
+      expect(upgradeCount).toBe(3);
+
+      const appliedAfter = dbAtV9.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify telegram_approval_callbacks table exists
+      const tables = dbAtV9.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'telegram_approval_callbacks'").all();
+      expect(tables.length).toBe(1);
+
+      // Verify indexes on telegram_approval_callbacks
+      const indexes = dbAtV9.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'telegram_approval_callbacks'").all() as Array<{ name: string }>;
+      const indexNames = indexes.map((i) => i.name);
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_hash');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_request');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_owner');
+      expect(indexNames).toContain('idx_telegram_approval_callbacks_expires');
+
+      // Verify owners table has telegram_user_id column
+      const ownerCols = dbAtV9.prepare("PRAGMA table_info('owners')").all() as Array<{ name: string }>;
+      expect(ownerCols.map((c) => c.name)).toContain('telegram_user_id');
+
+      // Verify notification_outbox table has reply_markup_enc column
+      const outboxCols = dbAtV9.prepare("PRAGMA table_info('notification_outbox')").all() as Array<{ name: string }>;
+      expect(outboxCols.map((c) => c.name)).toContain('reply_markup_enc');
+
+      // Verify subsequent runMigrations is idempotent
+      const rerun = runMigrations(dbAtV9);
+      expect(rerun).toBe(0);
+
+      dbAtV9.close();
+    });
+  });
+
+  describe('Migration 11 Upgrade Compatibility & Telegram Callbacks Link Epoch', () => {
+    it('should apply Migration 11 cleanly on existing v10 database and verify linked_at column', () => {
+      // 1. Build database up to v10
+      const dbAtV10 = createDatabase(':memory:');
+      dbAtV10.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 10)) {
+        dbAtV10.transaction(() => {
+          dbAtV10.exec(migration.up);
+          dbAtV10.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Verify v10 state
+      const appliedBefore = dbAtV10.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+      // Run runMigrations to apply Migrations 11 & 12
+      const upgradeCount = runMigrations(dbAtV10);
+      expect(upgradeCount).toBe(2);
+
+      const appliedAfter = dbAtV10.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify telegram_approval_callbacks table has linked_at column
+      const callbackCols = dbAtV10.prepare("PRAGMA table_info('telegram_approval_callbacks')").all() as Array<{ name: string }>;
+      expect(callbackCols.map((c) => c.name)).toContain('linked_at');
+
+      // Verify subsequent runMigrations is idempotent
+      const rerun = runMigrations(dbAtV10);
+      expect(rerun).toBe(0);
+
+      dbAtV10.close();
+    });
+  });
+
+  describe('Migration 12 Upgrade Compatibility & Owner Sessions', () => {
+    it('should apply Migration 12 cleanly on existing v11 database, preserve owner rows, and enforce FK cascade', () => {
+      const dbAtV11 = createDatabase(':memory:');
+      dbAtV11.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+      for (const migration of MIGRATIONS.slice(0, 11)) {
+        dbAtV11.transaction(() => {
+          dbAtV11.exec(migration.up);
+          dbAtV11.prepare(`
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, datetime('now'))
+          `).run(migration.version, migration.name);
+        }).immediate();
+      }
+
+      // Seed existing v11 owner with linked Telegram metadata
+      dbAtV11.prepare(`
+        INSERT INTO owners (
+          id, display_name, passphrase_hash, telegram_chat_id, telegram_user_id,
+          telegram_username, telegram_linked_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'default',
+        'Existing Owner',
+        '$argon2id$v=19$m=19456,t=2,p=1$salt$hash',
+        '555000111',
+        '999888777',
+        'existing_owner_tg',
+        '2026-11-01T10:00:00.000Z',
+        '2026-10-01T00:00:00.000Z'
+      );
+
+      const appliedBefore = dbAtV11.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedBefore.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+      // Apply Migration 12
+      const upgradeCount = runMigrations(dbAtV11);
+      expect(upgradeCount).toBe(1);
+
+      const appliedAfter = dbAtV11.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: number }>;
+      expect(appliedAfter.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+      // Verify owner_sessions columns
+      const sessionCols = dbAtV11.prepare("PRAGMA table_info('owner_sessions')").all() as Array<{ name: string; pk: number }>;
+      const colNames = sessionCols.map((c) => c.name);
+      expect(colNames).toEqual([
+        'session_key',
+        'owner_id',
+        'display_name',
+        'csrf_token',
+        'created_at',
+        'last_accessed_at',
+      ]);
+      expect(sessionCols.find((c) => c.name === 'session_key')?.pk).toBe(1);
+
+      // Verify indexes on owner_sessions
+      const indexes = dbAtV11
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'owner_sessions'")
+        .all() as Array<{ name: string }>;
+      const indexNames = indexes.map((i) => i.name);
+      expect(indexNames).toContain('idx_owner_sessions_owner_id');
+      expect(indexNames).toContain('idx_owner_sessions_last_accessed');
+      expect(indexNames).toContain('idx_owner_sessions_created_at');
+
+      // Existing owner row survived intact
+      const ownerRow = dbAtV11.prepare('SELECT * FROM owners WHERE id = ?').get('default') as {
+        telegram_user_id: string;
+        telegram_username: string;
+        telegram_linked_at: string;
+      };
+      expect(ownerRow.telegram_user_id).toBe('999888777');
+      expect(ownerRow.telegram_username).toBe('existing_owner_tg');
+      expect(ownerRow.telegram_linked_at).toBe('2026-11-01T10:00:00.000Z');
+
+      // Foreign key rejects unknown owner_id
+      expect(() => {
+        dbAtV11.prepare(`
+          INSERT INTO owner_sessions (
+            session_key, owner_id, display_name, csrf_token, created_at, last_accessed_at
+          ) VALUES ('key-bad', 'nonexistent', 'Bad', 'csrf-1', 1000, 1000)
+        `).run();
+      }).toThrowError(/FOREIGN KEY constraint failed/);
+
+      // ON DELETE CASCADE deletes sessions when owner is deleted
+      dbAtV11.prepare(`
+        INSERT INTO owner_sessions (
+          session_key, owner_id, display_name, csrf_token, created_at, last_accessed_at
+        ) VALUES ('key-good', 'default', 'Existing Owner', 'csrf-2', 1000, 1000)
+      `).run();
+      expect(
+        (dbAtV11.prepare('SELECT COUNT(*) as c FROM owner_sessions').get() as { c: number }).c
+      ).toBe(1);
+
+      dbAtV11.prepare('DELETE FROM owners WHERE id = ?').run('default');
+      expect(
+        (dbAtV11.prepare('SELECT COUNT(*) as c FROM owner_sessions').get() as { c: number }).c
+      ).toBe(0);
+
+      // Idempotent rerun
+      expect(runMigrations(dbAtV11)).toBe(0);
+
+      dbAtV11.close();
     });
   });
 });

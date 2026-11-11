@@ -7,6 +7,7 @@
  * - Setup confirmation / token exchange (POST /v3/vault/payment-tokens)
  * - Single payment token retrieval (GET /v3/vault/payment-tokens/{id})
  * - Payment token listing by customer_id (GET /v3/vault/payment-tokens?customer_id=...)
+ * - Payment token deletion (DELETE /v3/vault/payment-tokens/{id})
  * - Safe typed VaultError mapping and debug_id preservation
  * - Strict credential and access token redaction
  *
@@ -78,6 +79,12 @@ export interface VaultPaymentTokenListResult {
   readonly paymentTokens: readonly VaultPaymentTokenResult[];
 }
 
+export interface DeletePaymentTokenResult {
+  readonly deleted: boolean;
+  readonly status: number;
+  readonly debugId?: string;
+}
+
 export interface PayPalVaultServiceOptions {
   readonly client: PayPalHttpClient;
   readonly defaultConnectorKey?: string;
@@ -89,18 +96,20 @@ export interface PayPalVaultServiceOptions {
 
 export class VaultError extends Error {
   public readonly code: string;
+  public readonly status?: number;
   public readonly debugId?: string;
   public readonly causeError?: unknown;
 
   constructor(
     code: string,
     message: string,
-    options?: { debugId?: string; causeError?: unknown }
+    options?: { status?: number; debugId?: string; causeError?: unknown }
   ) {
     const debugSuffix = options?.debugId ? ` (debug_id: ${options.debugId})` : '';
     super(`[${code}] ${message}${debugSuffix}`);
     this.name = 'VaultError';
     this.code = code;
+    this.status = options?.status;
     this.debugId = options?.debugId;
     this.causeError = options?.causeError;
     Object.setPrototypeOf(this, new.target.prototype);
@@ -410,6 +419,54 @@ export class PayPalVaultService {
     }
   }
 
+  /**
+   * Deletes/revokes a vaulted payment-token (DELETE /v3/vault/payment-tokens/{id}).
+   *
+   * @param tokenId - The permanent payment token ID to revoke
+   * @param options - Optional connectorKey override
+   */
+  public async deletePaymentToken(
+    tokenId: string,
+    options?: { connectorKey?: string }
+  ): Promise<DeletePaymentTokenResult> {
+    if (!tokenId || tokenId.trim().length === 0) {
+      throw new VaultError(
+        'INVALID_PARAMETER',
+        'tokenId must be a non-empty string'
+      );
+    }
+
+    const connectorKey = options?.connectorKey ?? this.defaultConnectorKey;
+    const encodedId = encodeURIComponent(tokenId.trim());
+
+    try {
+      const response = await this.client.delete<unknown>(
+        `/v3/vault/payment-tokens/${encodedId}`,
+        { connectorKey }
+      );
+
+      if (response.status !== 204 && response.status !== 200) {
+        throw new VaultError(
+          'DELETE_PAYMENT_TOKEN_FAILED',
+          `Unexpected HTTP status ${response.status} deleting Vault payment token`,
+          { status: response.status, debugId: response.debugId }
+        );
+      }
+
+      return {
+        deleted: true,
+        status: response.status,
+        debugId: response.debugId,
+      };
+    } catch (err) {
+      this.handleError(
+        err,
+        'DELETE_PAYMENT_TOKEN_FAILED',
+        'Failed to delete Vault payment token'
+      );
+    }
+  }
+
   // ============================================================================
   // Private Helpers
   // ============================================================================
@@ -499,6 +556,7 @@ export class PayPalVaultService {
     }
     if (err instanceof PayPalHttpError) {
       throw new VaultError(err.code, err.message, {
+        status: err.status,
         debugId: err.debugId,
         causeError: err,
       });

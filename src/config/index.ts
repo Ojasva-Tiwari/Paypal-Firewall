@@ -17,6 +17,85 @@ import { DEFAULT_GEMINI_MODEL } from '../ai/types.js';
 
 export const SANDBOX_BASE_URL = 'https://api-m.sandbox.paypal.com';
 export const DEFAULT_AI_MODEL = DEFAULT_GEMINI_MODEL;
+export const DEFAULT_MAX_HARD_CAP_MINOR = toMinorUnits(1_000_000);
+
+export interface HardCapCeilingValidationResult {
+  readonly valid: boolean;
+  readonly hardCapMinor: number;
+  readonly maxHardCapMinor: number;
+  readonly message?: string;
+}
+
+/**
+ * Enforces that a policy's hard_cap_minor is a valid non-negative minor-unit integer
+ * and does not exceed the configured MAX_HARD_CAP_MINOR operational ceiling.
+ */
+export function validateHardCapWithinCeiling(
+  hardCapMinor: number,
+  maxHardCapMinor: MinorUnits = getConfig().maxHardCapMinor
+): HardCapCeilingValidationResult {
+  if (!Number.isInteger(maxHardCapMinor) || maxHardCapMinor < 1 || maxHardCapMinor > MAX_MINOR_UNITS) {
+    return {
+      valid: false,
+      hardCapMinor,
+      maxHardCapMinor,
+      message: `Configured MAX_HARD_CAP_MINOR ceiling (${String(maxHardCapMinor)}) is invalid`,
+    };
+  }
+  if (!Number.isInteger(hardCapMinor) || hardCapMinor < 0) {
+    return {
+      valid: false,
+      hardCapMinor,
+      maxHardCapMinor,
+      message: 'hard_cap_minor must be a non-negative integer minor units value',
+    };
+  }
+  if (hardCapMinor > maxHardCapMinor) {
+    return {
+      valid: false,
+      hardCapMinor,
+      maxHardCapMinor,
+      message: `hard_cap_minor (${hardCapMinor}) exceeds configured MAX_HARD_CAP_MINOR ceiling (${maxHardCapMinor})`,
+    };
+  }
+  return {
+    valid: true,
+    hardCapMinor,
+    maxHardCapMinor,
+  };
+}
+
+export function isLocalhostUrl(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host === '0.0.0.0' ||
+      host.endsWith('.localhost')
+    );
+  } catch {
+    return /(?:^|\/\/|@)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(?::|\/|$)/i.test(trimmed);
+  }
+}
+
+export function sanitizePublicBaseUrl(
+  rawUrl?: string | null,
+  isProduction = process.env.NODE_ENV === 'production'
+): string | undefined {
+  if (typeof rawUrl !== 'string') return undefined;
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return undefined;
+  if (isProduction && isLocalhostUrl(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
 
 export class ConfigError extends Error {
   public readonly issues?: z.ZodIssue[];
@@ -38,7 +117,7 @@ export interface PayGuardConfig {
   readonly isTest: boolean;
   readonly isDevelopment: boolean;
   readonly port: number;
-  readonly publicBaseUrl: string;
+  readonly publicBaseUrl?: string;
   readonly dbPath: string;
   readonly databasePath: string;
   readonly paypalEnv: 'SANDBOX' | 'PRODUCTION';
@@ -57,8 +136,13 @@ export interface PayGuardConfig {
   readonly aiModel: string;
   readonly geminiApiKey?: string;
   readonly aiScanMode: 'off' | 'advisory' | 'enforce';
+  readonly telegramMode: 'disabled' | 'webhook';
   readonly telegramBotToken?: string;
+  readonly telegramBotUsername?: string;
+  readonly telegramWebhookSecret?: string;
   readonly telegramOwnerChatId?: string;
+  readonly telegramEncryptionKey?: string;
+  readonly telegramPreviousEncryptionKey?: string;
   readonly trustProxy: boolean | number | string;
 }
 
@@ -139,8 +223,19 @@ const RawEnvSchema = z
     AI_MODEL: z.string().min(1, 'AI_MODEL cannot be empty').default(DEFAULT_AI_MODEL),
     GEMINI_API_KEY: z.string().optional(),
     AI_SCAN_MODE: z.enum(['off', 'advisory', 'enforce'] as const).default('advisory'),
+    TELEGRAM_MODE: z.enum(['disabled', 'webhook'] as const).default('disabled'),
     TELEGRAM_BOT_TOKEN: z.string().optional(),
+    TELEGRAM_BOT_USERNAME: z.string().optional(),
+    TELEGRAM_WEBHOOK_SECRET: z.string().optional(),
     TELEGRAM_OWNER_CHAT_ID: z.string().optional(),
+    TELEGRAM_ENCRYPTION_KEY: z
+      .string()
+      .regex(/^[0-9a-fA-F]{64}$/, 'TELEGRAM_ENCRYPTION_KEY must be a 64-character hexadecimal string')
+      .optional(),
+    TELEGRAM_PREVIOUS_ENCRYPTION_KEY: z
+      .string()
+      .regex(/^[0-9a-fA-F]{64}$/, 'TELEGRAM_PREVIOUS_ENCRYPTION_KEY must be a 64-character hexadecimal string')
+      .optional(),
     TRUST_PROXY: z
       .string()
       .optional()
@@ -168,6 +263,31 @@ const RawEnvSchema = z
     {
       message: 'Production PayPal environment is refused unless ALLOW_PRODUCTION=true',
       path: ['PAYPAL_ENV'],
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.TELEGRAM_MODE !== 'disabled') {
+        return typeof data.TELEGRAM_BOT_TOKEN === 'string' && data.TELEGRAM_BOT_TOKEN.trim().length > 0;
+      }
+      return true;
+    },
+    {
+      message: 'TELEGRAM_BOT_TOKEN is required when TELEGRAM_MODE is not disabled',
+      path: ['TELEGRAM_BOT_TOKEN'],
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.TELEGRAM_WEBHOOK_SECRET) {
+        const trimmed = data.TELEGRAM_WEBHOOK_SECRET.trim();
+        return /^[A-Za-z0-9_-]{1,256}$/.test(trimmed);
+      }
+      return true;
+    },
+    {
+      message: 'TELEGRAM_WEBHOOK_SECRET must be 1-256 characters matching [A-Za-z0-9_-]',
+      path: ['TELEGRAM_WEBHOOK_SECRET'],
     }
   );
 
@@ -197,15 +317,37 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new ConfigError('DATABASE_PATH / DB_PATH cannot be empty string');
   }
 
-  // Resolve public base URL
-  const resolvedPublicBaseUrl = (data.PUBLIC_BASE_URL?.trim() || `http://localhost:${data.PORT}`);
+  // Resolve public base URL (never synthesize http://localhost in production)
+  const isProduction = data.NODE_ENV === 'production';
+  const rawPublicBaseUrl = data.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '');
+  let resolvedPublicBaseUrl: string | undefined;
+
+  if (rawPublicBaseUrl && rawPublicBaseUrl.length > 0) {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(rawPublicBaseUrl);
+    } catch {
+      throw new ConfigError(`PUBLIC_BASE_URL must be a valid URL, received "${rawPublicBaseUrl}"`);
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new ConfigError(`PUBLIC_BASE_URL must use http or https scheme, received "${rawPublicBaseUrl}"`);
+    }
+    if (isProduction && isLocalhostUrl(rawPublicBaseUrl)) {
+      throw new ConfigError(
+        'PUBLIC_BASE_URL cannot point to localhost or a loopback address when NODE_ENV=production'
+      );
+    }
+    resolvedPublicBaseUrl = rawPublicBaseUrl;
+  } else {
+    resolvedPublicBaseUrl = isProduction ? undefined : `http://localhost:${data.PORT}`;
+  }
 
   // Resolve session secret (provide safe dev default if not specified)
   const resolvedSessionSecret = (data.SESSION_SECRET?.trim() || 'payguard-default-dev-session-secret-min16');
 
   return {
     nodeEnv: data.NODE_ENV,
-    isProduction: data.NODE_ENV === 'production',
+    isProduction,
     isTest: data.NODE_ENV === 'test',
     isDevelopment: data.NODE_ENV === 'development',
     port: data.PORT,
@@ -230,8 +372,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     aiModel: data.AI_MODEL,
     geminiApiKey: data.GEMINI_API_KEY?.trim() || undefined,
     aiScanMode: data.AI_SCAN_MODE,
+    telegramMode: data.TELEGRAM_MODE,
     telegramBotToken: data.TELEGRAM_BOT_TOKEN?.trim() || undefined,
+    telegramBotUsername: data.TELEGRAM_BOT_USERNAME?.trim()?.replace(/^@/, '') || undefined,
+    telegramWebhookSecret: data.TELEGRAM_WEBHOOK_SECRET?.trim() || undefined,
     telegramOwnerChatId: data.TELEGRAM_OWNER_CHAT_ID?.trim() || undefined,
+    telegramEncryptionKey: data.TELEGRAM_ENCRYPTION_KEY?.trim() || undefined,
+    telegramPreviousEncryptionKey: data.TELEGRAM_PREVIOUS_ENCRYPTION_KEY?.trim() || undefined,
     trustProxy: data.TRUST_PROXY,
   };
 }

@@ -338,6 +338,37 @@ describe('M2-T6: Core — executeDecision', () => {
   });
 
   // ==========================================================================
+  // Test 4b: Flow A Ambiguous AbortError
+  // ==========================================================================
+  it('4b. Flow A ambiguous AbortError timeout (leaves AUTO_EXECUTING, no RELEASE, fails closed)', async () => {
+    const req = seedRequest('AUTO_EXECUTING');
+
+    const abortError = new Error('This operation was aborted');
+    abortError.name = 'AbortError';
+
+    vi.mocked(mockOrdersService.createOrder).mockRejectedValue(abortError);
+
+    const execOptions: ExecuteDecisionOptions = {
+      db,
+      repos,
+      ordersService: mockOrdersService,
+    };
+
+    await expect(executeDecision({ requestId: req.id }, execOptions)).rejects.toThrow(
+      AmbiguousExecutionError
+    );
+
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('AUTO_EXECUTING');
+
+    const ledger = repos.ledger.listByRequestId(req.id);
+    expect(ledger.map((l) => l.kind)).toEqual(['RESERVE']);
+
+    const audit = repos.auditLog.listByRequestId(req.id);
+    expect(audit.some((a) => a.event === 'EXECUTION_AMBIGUOUS')).toBe(true);
+  });
+
+  // ==========================================================================
   // Test 5: Flow A Ambiguous 500 Server Error
   // ==========================================================================
   it('5. Flow A ambiguous 500 server error (leaves AUTO_EXECUTING, no RELEASE)', async () => {
@@ -837,5 +868,207 @@ describe('M2-T6: Core — executeDecision', () => {
     } finally {
       db.exec('ROLLBACK');
     }
+  });
+
+  // ==========================================================================
+  // M6-T5 WS5: Flow C Configuration Guard Before APPROVED -> CAPTURING
+  // ==========================================================================
+  it('M6-T5 Flow C refuses missing authorizationsService before transitioning APPROVED to CAPTURING', async () => {
+    const req = seedRequest('APPROVED', { paypalAuthorizationId: 'AUTH-GUARD-1' });
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        {
+          db,
+          repos,
+          // intentionally omit authorizationsService
+        }
+      )
+    ).rejects.toThrow(ExecuteDecisionError);
+
+    // Must remain APPROVED (never stranded in CAPTURING) and keep RESERVE intact
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('APPROVED');
+    expect(repos.ledger.listByRequestId(req.id).map((l) => l.kind)).toEqual(['RESERVE']);
+  });
+
+  // ==========================================================================
+  // Task C2: Order ID Preservation on 2xx Validation Failure (Flow A & Flow B)
+  // ==========================================================================
+  it('Task C2: Flow A preserves recovered orderId on OrderError without marking CAPTURED and blocks blind replay', async () => {
+    const req = seedRequest('AUTO_EXECUTING');
+
+    const orderError = new OrderError(
+      'INVALID_ORDER_RESPONSE',
+      'Order response missing amount or currency',
+      { debugId: 'dbg-fa-ord', orderId: 'ORD-RECOVERED-FA' }
+    );
+    vi.mocked(mockOrdersService.createOrder).mockRejectedValue(orderError);
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('AUTO_EXECUTING');
+    expect(updated.paypal_order_id).toBe('ORD-RECOVERED-FA');
+    expect(updated.paypal_capture_id).toBeNull();
+    expect(repos.ledger.listByRequestId(req.id).map((l) => l.kind)).toEqual(['RESERVE']);
+
+    const ambigAudit = repos.auditLog
+      .listByRequestId(req.id)
+      .find((a) => a.event === 'EXECUTION_AMBIGUOUS');
+    expect(ambigAudit).toBeDefined();
+    const payload = JSON.parse(ambigAudit!.payload!) as Record<string, unknown>;
+    expect(payload.paypal_order_id).toBe('ORD-RECOVERED-FA');
+    expect(payload.debug_id).toBe('dbg-fa-ord');
+
+    // Repeat call fails closed without calling createOrder again
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+    expect(mockOrdersService.createOrder).toHaveBeenCalledTimes(1);
+    expect(verifyDatabaseAuditChain(db).valid).toBe(true);
+  });
+
+  it('Task C2: Flow B preserves recovered orderId on OrderError while keeping HELD and blocking blind replay', async () => {
+    const req = seedRequest('HELD');
+
+    const orderError = new OrderError(
+      'CUSTOM_ID_MISMATCH',
+      'Returned custom_id mismatch',
+      { debugId: 'dbg-fb-ord', orderId: 'ORD-RECOVERED-FB' }
+    );
+    vi.mocked(mockOrdersService.createOrder).mockRejectedValue(orderError);
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('HELD');
+    expect(updated.paypal_order_id).toBe('ORD-RECOVERED-FB');
+    expect(updated.paypal_authorization_id).toBeNull();
+    expect(repos.ledger.listByRequestId(req.id).map((l) => l.kind)).toEqual(['RESERVE']);
+
+    const ambigAudit = repos.auditLog
+      .listByRequestId(req.id)
+      .find((a) => a.event === 'EXECUTION_AMBIGUOUS');
+    expect(ambigAudit).toBeDefined();
+    const payload = JSON.parse(ambigAudit!.payload!) as Record<string, unknown>;
+    expect(payload.paypal_order_id).toBe('ORD-RECOVERED-FB');
+    expect(payload.debug_id).toBe('dbg-fb-ord');
+
+    // Repeat call fails closed without calling createOrder again
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+    expect(mockOrdersService.createOrder).toHaveBeenCalledTimes(1);
+    expect(verifyDatabaseAuditChain(db).valid).toBe(true);
+  });
+
+  it('Task C2: Flow A preserves paypal_order_id and blocks blind replay when capture status is non-COMPLETED (PENDING)', async () => {
+    const req = seedRequest('AUTO_EXECUTING');
+
+    vi.mocked(mockOrdersService.createOrder).mockResolvedValue({
+      id: 'ORD-FLOWA-PEND',
+      status: 'COMPLETED',
+      intent: 'CAPTURE',
+      customId: req.id,
+      amountMinor: req.amount_minor,
+      currency: 'USD',
+      isCaptured: false,
+      isAuthorized: false,
+      capture: {
+        id: 'CAP-FLOWA-PEND',
+        status: 'PENDING',
+        amountMinor: req.amount_minor,
+        currency: 'USD',
+      },
+    });
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('AUTO_EXECUTING');
+    expect(updated.paypal_order_id).toBe('ORD-FLOWA-PEND');
+    expect(updated.paypal_capture_id).toBeNull();
+    expect(repos.ledger.listByRequestId(req.id).map((l) => l.kind)).toEqual(['RESERVE']);
+
+    const ambigAudit = repos.auditLog
+      .listByRequestId(req.id)
+      .find((a) => a.event === 'EXECUTION_AMBIGUOUS');
+    expect(ambigAudit).toBeDefined();
+    expect(JSON.parse(ambigAudit!.payload!)).toMatchObject({ paypal_order_id: 'ORD-FLOWA-PEND' });
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+    expect(mockOrdersService.createOrder).toHaveBeenCalledTimes(1);
+    expect(verifyDatabaseAuditChain(db).valid).toBe(true);
+  });
+
+  it('Task C2: Flow B preserves paypal_order_id while HELD when order returns without usable authorization', async () => {
+    const req = seedRequest('HELD');
+
+    vi.mocked(mockOrdersService.createOrder).mockResolvedValue({
+      id: 'ORD-FLOWB-NOAUTH',
+      status: 'PAYER_ACTION_REQUIRED',
+      intent: 'AUTHORIZE',
+      customId: req.id,
+      amountMinor: req.amount_minor,
+      currency: 'USD',
+      isCaptured: false,
+      isAuthorized: false,
+    });
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+
+    const updated = repos.paymentRequests.getById(req.id)!;
+    expect(updated.status).toBe('HELD');
+    expect(updated.paypal_order_id).toBe('ORD-FLOWB-NOAUTH');
+    expect(updated.paypal_authorization_id).toBeNull();
+    expect(repos.ledger.listByRequestId(req.id).map((l) => l.kind)).toEqual(['RESERVE']);
+
+    const ambigAudit = repos.auditLog
+      .listByRequestId(req.id)
+      .find((a) => a.event === 'EXECUTION_AMBIGUOUS');
+    expect(ambigAudit).toBeDefined();
+    expect(JSON.parse(ambigAudit!.payload!)).toMatchObject({ paypal_order_id: 'ORD-FLOWB-NOAUTH' });
+
+    await expect(
+      executeDecision(
+        { requestId: req.id },
+        { db, repos, ordersService: mockOrdersService }
+      )
+    ).rejects.toThrow(AmbiguousExecutionError);
+    expect(mockOrdersService.createOrder).toHaveBeenCalledTimes(1);
+    expect(verifyDatabaseAuditChain(db).valid).toBe(true);
   });
 });
