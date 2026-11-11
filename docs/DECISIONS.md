@@ -57,13 +57,13 @@ This document records the foundational decisions made for PayGuard. As spikes ar
 ### D9: MCP Server Exposed Over HTTP (`/mcp`)
 - **Date**: 2026-10-18
 - **Context**: Need standard connectivity for both remote and local AI agents.
-- **Decision**: Serve MCP over HTTP at `/mcp` with Bearer token authentication, supporting stdio for local development.
+- **Decision**: Serve MCP over HTTP at `/mcp` with Bearer token authentication, supporting stdio for local development. *(Updated by [D22](#d22-streamable-http-mcp-sole-supported-mcp-transport-deferring-stdio): `/mcp` Streamable HTTP is the sole active transport; local `stdio` is deferred.)*
 - **Consequences**: Unified transport for hackathon demonstration.
 
 ### D10: Pluggable AI Interface (Gemini First via Free Tier)
 - **Date**: 2026-10-18
 - **Context**: Zero-spend policy requires avoiding paid LLM billing.
-- **Decision**: Wrap AI operations behind an interface (`src/ai/provider.ts`). Implement Gemini using free-tier API keys from Google AI Studio, with template fallback when AI is unavailable.
+- **Decision**: Wrap AI operations behind a provider interface ([`src/ai/types.ts`](../src/ai/types.ts), [`src/ai/service.ts`](../src/ai/service.ts), [`src/ai/geminiProvider.ts`](../src/ai/geminiProvider.ts), and [`src/ai/mockProvider.ts`](../src/ai/mockProvider.ts)). Implement Gemini using free-tier API keys from Google AI Studio, with deterministic template fallback when AI is unavailable.
 - **Consequences**: No credit card or paid billing required; system remains functional if AI rate limits are reached.
 
 ### D11: Single Owner / Single Tenant Scope
