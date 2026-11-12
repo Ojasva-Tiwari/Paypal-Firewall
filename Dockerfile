@@ -62,15 +62,17 @@ COPY --chown=payguard:payguard --from=prod-deps /app/node_modules ./node_modules
 COPY --chown=payguard:payguard --from=builder /app/dist/src ./dist/src
 COPY --chown=payguard:payguard --from=builder /app/dist/demo ./dist/demo
 COPY --chown=payguard:payguard --from=builder /app/dist/web ./dist/web
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+  && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 VOLUME ["/app/data"]
 
 EXPOSE 3000
 
-USER payguard
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "const p=process.env.PORT||3000;fetch('http://127.0.0.1:'+p+'/healthz').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "dist/src/server.js"]
 
