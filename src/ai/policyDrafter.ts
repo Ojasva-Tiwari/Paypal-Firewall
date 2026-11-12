@@ -806,9 +806,13 @@ export class PolicyDrafter {
     }
 
     // 3. Critical Security Requirement: Injection Detection in enforce mode
-    const injectionScan = await this.injectionDetector.scan({
-      purpose: input.prompt,
-    });
+    const injectionScan = await this.injectionDetector.scan(
+      {
+        purpose: input.prompt,
+        scanContext: 'policy_authoring',
+      },
+      signal
+    );
 
     if (injectionScan.outcome === 'DETECTED') {
       throw new PolicyDrafterError(

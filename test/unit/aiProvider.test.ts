@@ -166,6 +166,27 @@ describe('M5-T1: AI Provider Architecture', () => {
         mock.generateStructured({ kind: 'test', prompt: 'invalid schema' }, RiskAnalysisSchema)
       ).rejects.toThrow(AiSchemaError);
     });
+
+    it('generates schema-valid default structured output for policy_drafter without customStructuredResponse', async () => {
+      const mock = new MockAiProvider({ simulatedLatencyMs: 0 });
+
+      const result = await mock.generateStructured(
+        {
+          kind: 'policy_drafter',
+          prompt: `ACTIVE FIREWALL POLICY:
+{}
+
+<<<UNTRUSTED_POLICY_PROMPT>>>
+Never allow payments more than 49 dollars without my approval
+<<<END_UNTRUSTED_POLICY_PROMPT>>>`,
+        },
+        AiPolicyDraftOutputSchema
+      );
+
+      expect(result.data.proposed_rules.auto_limit_minor).toBe(4900);
+      expect(result.data.explanation.length).toBeGreaterThan(0);
+      expect(result.data.unsupported_requests).toEqual([]);
+    });
   });
 
   // ==========================================================================
